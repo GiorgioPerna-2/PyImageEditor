@@ -1,7 +1,0 @@
-# Generato per compatibilità. Con uv, usa: uv sync
-# Versione Python richiesta: 3.12+
-
-PyQt6>=6.7.0
-Pillow>=10.4.0
-numpy>=2.0.0
-opencv-python>=4.10.0

@@ -205,3 +205,121 @@ def render_text(
 
     draw.text((x, y), text, fill=color, font=font)
     array[:] = np.array(pil_img)
+
+
+# ── Gradiente ─────────────────────────────────────────────────────────────────
+
+def apply_gradient(
+    array: np.ndarray,
+    x1: float, y1: float,
+    x2: float, y2: float,
+    color1: tuple[int, int, int, int],
+    color2: tuple[int, int, int, int],
+    mode: str = "linear",          # "linear" | "radial"
+    opacity: float = 1.0,          # 0.0–1.0, scala entrambi i colori
+    selection_mask: np.ndarray | None = None,
+    layer_offset_x: int = 0,
+    layer_offset_y: int = 0,
+) -> None:
+    """
+    Applica un gradiente sull'intera area del layer (o solo nella selezione).
+    x1,y1 → x2,y2 sono in coordinate canvas.
+    opacity scala l'alpha di entrambi i colori (0=trasparente, 1=pieno).
+    """
+    h, w = array.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    # Converti coordinate canvas → layer
+    lx1 = x1 - layer_offset_x;  ly1 = y1 - layer_offset_y
+    lx2 = x2 - layer_offset_x;  ly2 = y2 - layer_offset_y
+
+    if mode == "radial":
+        radius = max(1.0, np.hypot(lx2 - lx1, ly2 - ly1))
+        dist = np.sqrt((xx - lx1) ** 2 + (yy - ly1) ** 2)
+        t = np.clip(dist / radius, 0.0, 1.0)
+    else:
+        dx_v = lx2 - lx1;  dy_v = ly2 - ly1
+        length_sq = dx_v ** 2 + dy_v ** 2
+        if length_sq < 1.0:
+            return
+        t = ((xx - lx1) * dx_v + (yy - ly1) * dy_v) / length_sq
+        t = np.clip(t, 0.0, 1.0)
+
+    c1 = np.array(color1, dtype=np.float32)
+    c2 = np.array(color2, dtype=np.float32)
+    gradient = (c1 * (1.0 - t[:, :, np.newaxis]) +
+                c2 *        t[:, :, np.newaxis])
+
+    src_a = gradient[:, :, 3:4] / 255.0 * opacity
+
+    # Applica selezione canvas → layer
+    if selection_mask is not None:
+        mh, mw = selection_mask.shape
+        oy0 = max(0, layer_offset_y);  oy1 = min(mh, layer_offset_y + h)
+        ox0 = max(0, layer_offset_x);  ox1 = min(mw, layer_offset_x + w)
+        sel = np.zeros((h, w), dtype=np.float32)
+        if oy1 > oy0 and ox1 > ox0:
+            ly0 = oy0 - layer_offset_y;  lx0s = ox0 - layer_offset_x
+            sel[ly0:ly0+(oy1-oy0), lx0s:lx0s+(ox1-ox0)] = \
+                selection_mask[oy0:oy1, ox0:ox1].astype(np.float32)
+        src_a = src_a * sel[:, :, np.newaxis]
+
+    dst_f = array.astype(np.float32)
+    dst_a = dst_f[:, :, 3:4] / 255.0
+    out_a = src_a + dst_a * (1.0 - src_a)
+    denom = np.maximum(out_a, 1e-8)
+    out_rgb = (gradient[:, :, :3] * src_a +
+               dst_f[:, :, :3] * dst_a * (1.0 - src_a)) / denom
+    result = dst_f.copy()
+    result[:, :, :3] = out_rgb
+    result[:, :, 3:4] = out_a * 255.0
+    array[:] = np.clip(result, 0, 255).astype(np.uint8)
+
+
+# ── Healing brush ─────────────────────────────────────────────────────────────
+
+def build_heal_mask(
+    array: np.ndarray,
+    cx: float, cy: float,
+    size: int,
+    hardness: float = 0.8,
+) -> np.ndarray:
+    """Costruisce la maschera uint8 per heal (stesso profilo circolare del pennello)."""
+    h, w = array.shape[:2]
+    r = max(1, size // 2)
+    diam = 2 * r + 1
+    yy, xx = np.mgrid[:diam, :diam]
+    dist = np.sqrt(((xx - r) ** 2 + (yy - r) ** 2).astype(np.float32))
+    inner = r * max(0.0, min(1.0, hardness))
+    m = np.zeros(dist.shape, dtype=np.float32)
+    m[dist <= inner] = 1.0
+    soft = (dist > inner) & (dist <= r)
+    if soft.any() and r > inner:
+        m[soft] = 1.0 - (dist[soft] - inner) / max(r - inner, 1e-6)
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    icx, icy = int(round(cx)), int(round(cy))
+    iy0 = max(0, icy - r);  iy1 = min(h, icy + r + 1)
+    ix0 = max(0, icx - r);  ix1 = min(w, icx + r + 1)
+    if iy0 >= iy1 or ix0 >= ix1:
+        return mask
+    my0 = iy0 - (icy - r)
+    mx0 = ix0 - (icx - r)
+    rh = iy1 - iy0
+    rw = ix1 - ix0
+    region = (m[my0:my0 + rh, mx0:mx0 + rw] * 255).astype(np.uint8)
+    np.maximum(mask[iy0:iy1, ix0:ix1], region, out=mask[iy0:iy1, ix0:ix1])
+    return mask
+
+
+def apply_healing(
+    array: np.ndarray,
+    heal_mask: np.ndarray,
+    radius: int = 5,
+) -> None:
+    """cv2.inpaint sull'area coperta da heal_mask. Modifica array in-place."""
+    import cv2
+    if not heal_mask.any():
+        return
+    bgr = cv2.cvtColor(array[:, :, :3], cv2.COLOR_RGB2BGR)
+    healed_bgr = cv2.inpaint(bgr, heal_mask, radius, cv2.INPAINT_TELEA)
+    array[:, :, :3] = cv2.cvtColor(healed_bgr, cv2.COLOR_BGR2RGB)

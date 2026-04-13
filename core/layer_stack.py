@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
-from .layer import Layer, LayerGroup, NodeType, node_from_snapshot
+from .layer import Layer, LayerGroup, AdjustmentLayer, NodeType, node_from_snapshot
 
 # Tipo path: tupla di indici che naviga l'albero dall'alto
 # Es: (2,) = nodo top-level index 2
@@ -55,9 +55,9 @@ class LayerStack:
         return parent.children
 
     def _find_first_leaf(self, path: Path) -> Path | None:
-        """Ritorna il path del primo Layer foglia dentro il nodo indicato."""
+        """Ritorna il path del primo Layer/AdjustmentLayer foglia dentro il nodo indicato."""
         node = self.get_node(path)
-        if isinstance(node, Layer):
+        if isinstance(node, (Layer, AdjustmentLayer)):
             return path
         if isinstance(node, LayerGroup):
             for i, child in enumerate(node.children):
@@ -67,7 +67,7 @@ class LayerStack:
         return None
 
     def _all_leaf_paths(self) -> list[Path]:
-        """Tutti i path alle foglie Layer nell'albero, ordine di visita."""
+        """Tutti i path alle foglie Layer/AdjustmentLayer nell'albero, ordine di visita."""
         result: list[Path] = []
         self._collect_leaves(self._nodes, (), result)
         return result
@@ -76,17 +76,18 @@ class LayerStack:
                         result: list[Path]) -> None:
         for i, node in enumerate(nodes):
             path = (*prefix, i)
-            if isinstance(node, Layer):
+            if isinstance(node, (Layer, AdjustmentLayer)):
                 result.append(path)
-            else:
+            elif isinstance(node, LayerGroup):
                 self._collect_leaves(node.children, path, result)
 
     # ── Proprietà ─────────────────────────────────────────────────────
 
     @property
-    def active(self) -> Layer:
+    def active(self) -> Layer | AdjustmentLayer:
         node = self.get_node(self._active_path)
-        assert isinstance(node, Layer), "active_path punta a un gruppo"
+        assert isinstance(node, (Layer, AdjustmentLayer)), \
+            "active_path punta a un gruppo"
         return node
 
     @property
@@ -109,10 +110,9 @@ class LayerStack:
 
     def set_active_path(self, path: Path) -> None:
         node = self.get_node(path)
-        if isinstance(node, Layer):
+        if isinstance(node, (Layer, AdjustmentLayer)):
             self._active_path = path
         elif isinstance(node, LayerGroup):
-            # Seleziona il primo foglio del gruppo
             leaf = self._find_first_leaf(path)
             if leaf:
                 self._active_path = leaf
@@ -348,6 +348,10 @@ class LayerStack:
             if skip_path is not None and current_path == skip_path:
                 continue   # escludi il layer attivo (per pre-composite background)
             if not node.visible:
+                continue
+            if isinstance(node, AdjustmentLayer):
+                # Applica la regolazione al composito accumulato finora
+                result = node.apply(result)
                 continue
             if isinstance(node, LayerGroup):
                 # Composta i figli in un buffer temporaneo

@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QFrame, QMenu, QToolButton,
 )
 import numpy as np
-from core.layer import Layer, LayerGroup, BLEND_MODES
+from core.layer import Layer, LayerGroup, AdjustmentLayer, BLEND_MODES
 from core.layer_stack import LayerStack, Path
 
 THUMB_W = 44
@@ -268,7 +268,14 @@ class LayerPanel(QWidget):
             item = QTreeWidgetItem(parent_item)
             item.setData(COL_NAME, Qt.ItemDataRole.UserRole, path)
 
-            if isinstance(node, LayerGroup):
+            if isinstance(node, AdjustmentLayer):
+                item.setText(COL_VIS, "👁" if node.visible else " ")
+                item.setText(COL_NAME, f"⚙ {node.name}")
+                item.setForeground(COL_NAME, QColor(120, 200, 160))
+                if path == active_path:
+                    f = item.font(COL_NAME); f.setBold(True); item.setFont(COL_NAME, f)
+                    item.setBackground(COL_NAME, QColor(80, 120, 200, 60))
+            elif isinstance(node, LayerGroup):
                 icon_px = _make_group_icon()
                 item.setIcon(COL_ICON, QIcon(icon_px))
                 vis_text = "👁" if node.visible else " "

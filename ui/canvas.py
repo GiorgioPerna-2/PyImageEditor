@@ -4,7 +4,7 @@ from enum import Enum, auto
 from typing import Optional
 
 import numpy as np
-from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
+from PyQt6.QtCore import Qt, QRectF, QPointF, QPoint, pyqtSignal
 from PyQt6.QtGui import (
     QImage, QPixmap, QWheelEvent, QMouseEvent, QKeyEvent,
     QPainter, QPen, QColor, QBrush, QFont, QFontMetrics,
@@ -28,11 +28,13 @@ class CanvasMode(Enum):
     SMUDGE     = auto()
     EYEDROPPER = auto()
     TEXT       = auto()
-    GRABCUT    = auto()   # rettangolo selezione per GrabCut
-    SELECT_RECT   = auto()   # selezione rettangolare
-    SELECT_ELLIPSE = auto()  # selezione ellittica
-    SELECT_LASSO  = auto()   # lasso libero
-    CLONE         = auto()   # timbro clone
+    GRABCUT    = auto()
+    SELECT_RECT    = auto()
+    SELECT_ELLIPSE = auto()
+    SELECT_LASSO   = auto()
+    CLONE          = auto()
+    GRADIENT       = auto()
+    HEAL           = auto()
 
 
 class _Handle(Enum):
@@ -90,6 +92,13 @@ class ImageCanvas(QGraphicsView):
     # Text tool: current text anchor in scene (=image) coordinates
     text_anchor_changed = pyqtSignal(float, float)
 
+    # Gradiente: x1,y1,x2,y2 coordinate scena al rilascio
+    gradient_applied = pyqtSignal(float, float, float, float)
+    # Healing brush: stesse porte del pennello
+    heal_stroke_begin = pyqtSignal(float, float)
+    heal_stroke_move  = pyqtSignal(float, float)
+    heal_stroke_end   = pyqtSignal()
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
@@ -133,9 +142,24 @@ class ImageCanvas(QGraphicsView):
         self._ants_offset: int = 0                     # fase animazione
 
         # Clone stamp stato
-        self._clone_source: Optional[QPointF] = None   # scene coords sorgente
+        self._clone_source: Optional[QPointF] = None
         self._clone_drawing = False
         self._clone_alt_held = False
+
+        # Gradiente stato
+        self._grad_start: Optional[QPointF] = None
+        self._grad_end:   Optional[QPointF] = None
+
+        # Heal stato
+        self._heal_drawing = False
+
+        # Righelli e griglia
+        self._show_rulers:   bool = False
+        self._show_grid:     bool = False
+        self._grid_spacing:  int  = 50
+        self._grid_color:    QColor = QColor(128, 128, 255, 80)
+        self._grid_width:    float  = 1.0
+        self._ruler_font_pt: int    = 8
 
         self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
@@ -303,25 +327,55 @@ class ImageCanvas(QGraphicsView):
         self.viewport().update()
 
     def set_draw_mode(self, tool: str) -> None:
-        """tool = 'brush' | 'eraser' | 'smudge' | 'eyedropper' | 'text' | ''"""
+        """tool = 'brush'|'eraser'|'smudge'|'eyedropper'|'text'|'gradient'|'heal'|''"""
         _map = {
             "brush":      CanvasMode.BRUSH,
             "eraser":     CanvasMode.ERASER,
             "smudge":     CanvasMode.SMUDGE,
             "eyedropper": CanvasMode.EYEDROPPER,
             "text":       CanvasMode.TEXT,
+            "gradient":   CanvasMode.GRADIENT,
+            "heal":       CanvasMode.HEAL,
         }
         self._mode = _map.get(tool, CanvasMode.NORMAL)
         self._drawing = False
+        self._heal_drawing = False
+        self._grad_start = None
+        self._grad_end   = None
 
         cursor_map = {
             CanvasMode.BRUSH:      Qt.CursorShape.BlankCursor,
             CanvasMode.ERASER:     Qt.CursorShape.BlankCursor,
             CanvasMode.SMUDGE:     Qt.CursorShape.BlankCursor,
+            CanvasMode.HEAL:       Qt.CursorShape.BlankCursor,
             CanvasMode.EYEDROPPER: Qt.CursorShape.CrossCursor,
             CanvasMode.TEXT:       Qt.CursorShape.IBeamCursor,
+            CanvasMode.GRADIENT:   Qt.CursorShape.CrossCursor,
         }
         self.setCursor(cursor_map.get(self._mode, Qt.CursorShape.ArrowCursor))
+        self.viewport().update()
+
+    # ── API righelli / griglia ────────────────────────────────────────
+
+    def set_rulers_visible(self, visible: bool) -> None:
+        self._show_rulers = visible
+        self.viewport().update()
+
+    def set_grid_visible(self, visible: bool) -> None:
+        self._show_grid = visible
+        self.viewport().update()
+
+    def set_grid_spacing(self, px: int) -> None:
+        self._grid_spacing = max(4, px)
+        self.viewport().update()
+
+    def set_grid_style(self, color: QColor, width: float) -> None:
+        self._grid_color = color
+        self._grid_width = max(0.5, width)
+        self.viewport().update()
+
+    def set_ruler_font_size(self, pt: int) -> None:
+        self._ruler_font_pt = max(6, pt)
         self.viewport().update()
 
     def set_brush_size(self, size: int) -> None:
@@ -434,6 +488,17 @@ class ImageCanvas(QGraphicsView):
                 self.stroke_begin.emit(sp.x(), sp.y())
             return
 
+        if self._mode == CanvasMode.GRADIENT and event.button() == Qt.MouseButton.LeftButton:
+            self._grad_start = QPointF(sp)
+            self._grad_end   = QPointF(sp)
+            return
+
+        if self._mode == CanvasMode.HEAL and event.button() == Qt.MouseButton.LeftButton:
+            self._heal_drawing = True
+            self._cursor_pos = vp
+            self.heal_stroke_begin.emit(sp.x(), sp.y())
+            return
+
         if self._mode == CanvasMode.EYEDROPPER and event.button() == Qt.MouseButton.LeftButton:
             if self._image_array is not None:
                 x, y = int(sp.x()), int(sp.y())
@@ -542,6 +607,20 @@ class ImageCanvas(QGraphicsView):
             self.viewport().update()
             return
 
+        if self._mode == CanvasMode.GRADIENT:
+            self._cursor_pos = vp
+            if self._grad_start is not None:
+                self._grad_end = QPointF(sp)
+                self.viewport().update()
+            return
+
+        if self._mode == CanvasMode.HEAL:
+            self._cursor_pos = vp
+            if self._heal_drawing:
+                self.heal_stroke_move.emit(sp.x(), sp.y())
+            self.viewport().update()
+            return
+
         if self._mode == CanvasMode.TEXT:
             self._cursor_pos = vp
             if self._text_dragging and self._text_anchor is not None:
@@ -594,6 +673,25 @@ class ImageCanvas(QGraphicsView):
         if self._mode in (CanvasMode.BRUSH, CanvasMode.ERASER, CanvasMode.SMUDGE):
             if event.button() == Qt.MouseButton.LeftButton and self._drawing:
                 self._drawing = False; self.stroke_end.emit()
+            return
+
+        if self._mode == CanvasMode.GRADIENT:
+            if event.button() == Qt.MouseButton.LeftButton and self._grad_start is not None:
+                vp = event.position()
+                sp = self.mapToScene(vp.toPoint())
+                self._grad_end = QPointF(sp)
+                self.gradient_applied.emit(
+                    self._grad_start.x(), self._grad_start.y(),
+                    self._grad_end.x(),   self._grad_end.y())
+                self._grad_start = None
+                self._grad_end   = None
+                self.viewport().update()
+            return
+
+        if self._mode == CanvasMode.HEAL:
+            if event.button() == Qt.MouseButton.LeftButton and self._heal_drawing:
+                self._heal_drawing = False
+                self.heal_stroke_end.emit()
             return
 
         if self._mode == CanvasMode.TEXT:
@@ -734,11 +832,125 @@ class ImageCanvas(QGraphicsView):
         if self._mode == CanvasMode.CLONE:
             self._draw_clone_overlay(painter)
 
+        # Gradiente — anteprima linea direzionale
+        if self._mode == CanvasMode.GRADIENT and self._grad_start is not None and self._grad_end is not None:
+            self._draw_badge(painter, "🌈 Gradiente — trascina per applicare", QColor(180, 80, 255))
+            self._draw_gradient_preview(painter)
+
+        # Healing brush — cursore pennello
+        if self._mode == CanvasMode.HEAL:
+            self._draw_brush_cursor(painter)
+            self._draw_badge(painter, "🩹 Guarigione — dipingi sull'area da riparare", QColor(80, 200, 130))
+
         # Crop / GrabCut overlay (coordinate SCENA)
         if self._mode == CanvasMode.CROP and self._crop_rect is not None:
             self._draw_crop_overlay(painter, scene_rect)
         if self._mode == CanvasMode.GRABCUT and self._crop_rect is not None:
             self._draw_grabcut_overlay(painter, scene_rect)
+
+        # Griglia (coordinate scena)
+        if self._show_grid:
+            self._draw_grid(painter, scene_rect)
+
+        # Righelli (coordinate viewport)
+        if self._show_rulers:
+            self._draw_rulers(painter)
+
+    def _draw_gradient_preview(self, painter: QPainter) -> None:
+        """Linea + cerchi che mostrano direzione e lunghezza del gradiente."""
+        zoom = max(self._zoom_factor, 1e-4)
+        p1, p2 = self._grad_start, self._grad_end
+        painter.setPen(QPen(QColor(200, 100, 255, 220), 1.5 / zoom))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLine(p1, p2)
+        r = 5 / zoom
+        painter.setBrush(QBrush(QColor(200, 100, 255, 180)))
+        painter.drawEllipse(p1, r, r)
+        painter.drawEllipse(p2, r, r)
+
+    def _draw_grid(self, painter: QPainter, scene_rect: QRectF) -> None:
+        """Griglia con passo _grid_spacing pixel immagine, in coordinate scena."""
+        step = self._grid_spacing
+        if step <= 0:
+            return
+        zoom = max(self._zoom_factor, 1e-4)
+        pen = QPen(self._grid_color, self._grid_width / zoom)
+        pen.setCosmetic(False)
+        painter.setPen(pen)
+
+        x_start = int(scene_rect.left()  // step) * step
+        y_start = int(scene_rect.top()   // step) * step
+        x = x_start
+        while x <= scene_rect.right():
+            painter.drawLine(QPointF(x, scene_rect.top()), QPointF(x, scene_rect.bottom()))
+            x += step
+        y = y_start
+        while y <= scene_rect.bottom():
+            painter.drawLine(QPointF(scene_rect.left(), y), QPointF(scene_rect.right(), y))
+            y += step
+
+    def _draw_rulers(self, painter: QPainter) -> None:
+        """Righelli lungo i bordi superiore e sinistro, in coordinate viewport."""
+        RULER_W = 20        # spessore righello in pixel schermo
+        TICK_MAJOR = 100    # pixel immagine tra tick grandi
+        TICK_MINOR = 10
+
+        painter.save()
+        painter.resetTransform()   # coordinate viewport
+
+        vp = self.viewport().rect()
+        zoom = max(self._zoom_factor, 1e-4)
+
+        # Sfondo righelli
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(50, 50, 50, 210)))
+        painter.drawRect(0, 0, vp.width(), RULER_W)           # orizzontale
+        painter.drawRect(0, 0, RULER_W, vp.height())          # verticale
+        painter.drawRect(0, 0, RULER_W, RULER_W)              # angolo
+
+        painter.setPen(QPen(QColor(180, 180, 180), 1))
+        font = painter.font(); font.setPointSize(self._ruler_font_pt); painter.setFont(font)
+
+        # --- Righello orizzontale ---
+        # Converte pixel scena → pixel viewport per trovare la fase iniziale
+        scene_left = self.mapToScene(QPoint(RULER_W, 0)).x()
+        scene_right = self.mapToScene(QPoint(vp.width(), 0)).x()
+
+        img_x_start = int(scene_left // TICK_MINOR) * TICK_MINOR
+        img_x = img_x_start
+        while img_x <= scene_right:
+            vp_x = int(self.mapFromScene(QPointF(img_x, 0)).x())
+            if vp_x < RULER_W:
+                img_x += TICK_MINOR; continue
+            is_major = (img_x % TICK_MAJOR == 0)
+            tick_h = 10 if is_major else 5
+            painter.drawLine(vp_x, RULER_W - tick_h, vp_x, RULER_W)
+            if is_major and vp_x + 4 < vp.width():
+                painter.drawText(vp_x + 2, RULER_W - 2, str(img_x))
+            img_x += TICK_MINOR
+
+        # --- Righello verticale ---
+        scene_top    = self.mapToScene(QPoint(0, RULER_W)).y()
+        scene_bottom = self.mapToScene(QPoint(0, vp.height())).y()
+
+        img_y_start = int(scene_top // TICK_MINOR) * TICK_MINOR
+        img_y = img_y_start
+        while img_y <= scene_bottom:
+            vp_y = int(self.mapFromScene(QPointF(0, img_y)).y())
+            if vp_y < RULER_W:
+                img_y += TICK_MINOR; continue
+            is_major = (img_y % TICK_MAJOR == 0)
+            tick_w = 10 if is_major else 5
+            painter.drawLine(RULER_W - tick_w, vp_y, RULER_W, vp_y)
+            if is_major and vp_y + 4 < vp.height():
+                painter.save()
+                painter.translate(RULER_W - 2, vp_y - 2)
+                painter.rotate(-90)
+                painter.drawText(0, 0, str(img_y))
+                painter.restore()
+            img_y += TICK_MINOR
+
+        painter.restore()
 
     def _draw_brush_cursor(self, painter: QPainter) -> None:
         """Cursore pennello in coordinate VIEWPORT (resetTransform)."""

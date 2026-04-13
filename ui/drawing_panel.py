@@ -11,19 +11,21 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QSlider, QLabel, QColorDialog,
     QGroupBox, QFrame, QButtonGroup, QLineEdit,
-    QFontComboBox, QSpinBox, QCheckBox, QScrollArea,
+    QFontComboBox, QSpinBox, QCheckBox, QScrollArea, QComboBox,
 )
 
 TOOLS = [
-    ("brush",      "🖌",  "Pennello  [B]"),
-    ("eraser",     "⬜",  "Gomma     [E]"),
-    ("smudge",     "💧",  "Sfumino   [U]"),
-    ("eyedropper", "🔍",  "Contagocce [I]"),
-    ("text",       "T",   "Testo     [T]"),
-    ("select_rect",   "⬜Sel", "Selezione rettangolare [S]"),
-    ("select_ellipse","◯Sel", "Selezione ellittica"),
-    ("select_lasso",  "🔗",   "Lasso libero [L]"),
-    ("clone",      "🔁",  "Timbro clone [C]"),
+    ("brush",          "🖌",    "Pennello  [B]"),
+    ("eraser",         "⬜",    "Gomma     [E]"),
+    ("smudge",         "💧",    "Sfumino   [U]"),
+    ("eyedropper",     "🔍",    "Contagocce [I]"),
+    ("text",           "T",     "Testo     [T]"),
+    ("select_rect",    "⬜Sel", "Selezione rettangolare [S]"),
+    ("select_ellipse", "◯Sel", "Selezione ellittica"),
+    ("select_lasso",   "🔗",    "Lasso libero [L]"),
+    ("clone",          "🔁",    "Timbro clone [C]"),
+    ("gradient",       "🌈",    "Gradiente [G]"),
+    ("heal",           "🩹",    "Guarigione [H]"),
 ]
 
 
@@ -50,11 +52,22 @@ class _ColorSwatch(QFrame):
         self._color = QColor(c); self._refresh()
 
     def mousePressEvent(self, _event):
-        picked = QColorDialog.getColor(self._color, self, "Scegli colore",
-                                       QColorDialog.ColorDialogOption.ShowAlphaChannel)
-        if picked.isValid():
-            self._color = picked; self._refresh()
-            self.color_changed.emit(picked)
+        dlg = QColorDialog(self._color, self)
+        dlg.setWindowTitle("Scegli colore")
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        # Forza colori UI stabili indipendentemente dal tema di sistema
+        dlg.setStyleSheet(
+            "QColorDialog, QColorDialog * { background: #2b2b2b; color: #dddddd; }"
+            "QPushButton { background: #444; color: #ddd; border: 1px solid #666; "
+            "padding: 4px 10px; border-radius: 3px; }"
+            "QPushButton:hover { background: #555; }"
+            "QPushButton:pressed { background: #333; }"
+        )
+        if dlg.exec():
+            picked = dlg.currentColor()
+            if picked.isValid():
+                self._color = picked; self._refresh()
+                self.color_changed.emit(picked)
 
 
 class DrawingPanel(QWidget):
@@ -242,6 +255,41 @@ class DrawingPanel(QWidget):
         self._clone_hint.setVisible(False)
         root.addWidget(self._clone_hint)
 
+        # ── Sezione Gradiente ─────────────────────────────────────────
+        self._grad_box = QGroupBox("Gradiente")
+        grad_layout = QVBoxLayout(self._grad_box)
+        # Colore 2
+        grad_c2_row = QHBoxLayout()
+        grad_c2_row.addWidget(QLabel("Colore 2:"))
+        self._swatch2 = _ColorSwatch(QColor(255, 255, 255, 255))
+        self._swatch2.color_changed.connect(lambda c: None)
+        grad_c2_row.addWidget(self._swatch2)
+        grad_c2_row.addStretch()
+        grad_layout.addLayout(grad_c2_row)
+        # Tipo gradiente
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Tipo:"))
+        self._combo_grad_mode = QComboBox()
+        self._combo_grad_mode.addItem("Lineare", "linear")
+        self._combo_grad_mode.addItem("Radiale", "radial")
+        mode_row.addWidget(self._combo_grad_mode)
+        grad_layout.addLayout(mode_row)
+        # Opacità gradiente
+        op_row = QHBoxLayout()
+        op_row.addWidget(QLabel("Opacità:"))
+        self._grad_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self._grad_opacity_slider.setRange(0, 100)
+        self._grad_opacity_slider.setValue(100)
+        self._lbl_grad_opacity = QLabel("100%")
+        self._lbl_grad_opacity.setMinimumWidth(38)
+        self._grad_opacity_slider.valueChanged.connect(
+            lambda v: self._lbl_grad_opacity.setText(f"{v}%"))
+        op_row.addWidget(self._grad_opacity_slider)
+        op_row.addWidget(self._lbl_grad_opacity)
+        grad_layout.addLayout(op_row)
+        self._grad_box.setVisible(False)
+        root.addWidget(self._grad_box)
+
         root.addStretch()
 
     # ── Public API ────────────────────────────────────────────────────
@@ -263,6 +311,20 @@ class DrawingPanel(QWidget):
     def hardness(self) -> int:   return self._hard_slider.value()
     @property
     def opacity(self) -> int:    return self._op_slider.value()
+
+    @property
+    def gradient_color2(self) -> QColor:
+        return self._swatch2.color() if hasattr(self, "_swatch2") else QColor(255, 255, 255, 255)
+    @property
+    def gradient_mode(self) -> str:
+        if hasattr(self, "_combo_grad_mode"):
+            return self._combo_grad_mode.currentData()
+        return "linear"
+    @property
+    def gradient_opacity(self) -> float:
+        if hasattr(self, "_grad_opacity_slider"):
+            return self._grad_opacity_slider.value() / 100.0
+        return 1.0
 
     @property
     def text_content(self) -> str: return self._txt_input.text()
@@ -303,11 +365,12 @@ class DrawingPanel(QWidget):
             btn.setChecked(k == self._active_tool)
 
         # Mostra/nascondi sezioni contestuali
-        is_draw   = self._active_tool in ("brush", "eraser", "smudge")
+        is_draw   = self._active_tool in ("brush", "eraser", "smudge", "heal")
         is_clone  = self._active_tool == "clone"
         is_text   = self._active_tool == "text"
         is_eye    = self._active_tool == "eyedropper"
         is_select = self._active_tool in ("select_rect", "select_ellipse", "select_lasso")
+        is_grad   = self._active_tool == "gradient"
 
         self._size_box.setVisible(is_draw or is_clone)
         self._hard_box.setVisible(is_draw or is_clone)
@@ -317,10 +380,13 @@ class DrawingPanel(QWidget):
             self._sel_box.setVisible(is_select)
         if hasattr(self, "_clone_hint"):
             self._clone_hint.setVisible(is_clone)
+        if hasattr(self, "_grad_box"):
+            self._grad_box.setVisible(is_grad)
 
-        # Rinomina "Durezza" per smudge/clone
         if self._active_tool == "smudge":
             self._hard_box.setTitle("Intensità sfumino")
+        elif self._active_tool == "heal":
+            self._hard_box.setTitle("Morbidezza guarigione")
         elif is_clone:
             self._hard_box.setTitle("Morbidezza")
         else:

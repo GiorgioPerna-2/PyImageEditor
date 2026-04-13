@@ -16,7 +16,7 @@ from core.filter_stack import FilterStack
 from core.layer_stack import LayerStack, Path as LayerPath
 from core.layer import Layer, LayerGroup
 from core.drawing import paint_stamp, interpolate_stroke
-from core.drawing_tools import apply_smudge
+from core.drawing_tools import apply_smudge, apply_gradient, build_heal_mask, apply_healing
 from core.drawing_engine import draw_text
 from core.selection import (mask_from_rect, mask_from_ellipse, mask_from_lasso,
                             invert_mask, select_all, copy_region, cut_region,
@@ -32,6 +32,11 @@ from utils.file_io import load_image, save_image
 from utils.project_io import save_project, load_project
 from utils.ora_io import save_ora, load_ora
 from ui.matting_panel import MattingPanel
+from ui.adjustment_panel import AdjustmentPanel
+from ui.free_transform_panel import FreeTransformPanel
+from core.layer import AdjustmentLayer
+from core.free_transform import apply_transform
+from ui.history_panel import HistoryPanel
 
 
 class _RembgWorker(QObject):
@@ -81,6 +86,9 @@ class MainWindow(QMainWindow):
         self._sel_clipboard: Optional[np.ndarray] = None  # RGBA patch copiato
         self._sel_feather: int = 0
 
+        # Free transform
+        self._ft_original_data: Optional[np.ndarray] = None   # dati pre-transform
+
         # Clone stamp
         self._clone_source_canvas: Optional[tuple[float,float]] = None  # canvas coords
         self._clone_source_layer: Optional[tuple[float,float]] = None   # layer coords
@@ -88,8 +96,9 @@ class MainWindow(QMainWindow):
         self._clone_last_src: Optional[tuple[float,float]] = None
         self._clone_timer_id: int = 0
         self._draw_bg_cache: np.ndarray | None = None
-        self._rembg_thread: QThread | None = None    # None = nessun thread attivo
-        self._rembg_worker: _RembgWorker | None = None   # pre-composite senza layer attivo
+        self._rembg_thread: QThread | None = None
+        self._rembg_worker: _RembgWorker | None = None
+        self._heal_mask_acc: np.ndarray | None = None   # maschera cumulativa del tratto heal
 
         self._canvas = ImageCanvas()
         self.setCentralWidget(self._canvas)
@@ -99,12 +108,16 @@ class MainWindow(QMainWindow):
         self._export_panel    = ExportPanel()
         self._layer_panel     = LayerPanel()
         self._drawing_panel   = DrawingPanel()
-        self._matting_panel   = MattingPanel()
+        self._matting_panel      = MattingPanel()
+        self._adjustment_panel   = AdjustmentPanel()
+        self._free_transform_panel = FreeTransformPanel()
 
         tabs = QTabWidget()
         tabs.setMinimumWidth(290)
         tabs.addTab(self._drawing_panel,   "✏ Disegno")
-        tabs.addTab(self._matting_panel,   "✂ Scontorna")
+        tabs.addTab(self._matting_panel,      "✂ Scontorna")
+        tabs.addTab(self._adjustment_panel,   "⚙ Regolazioni")
+        tabs.addTab(self._free_transform_panel, "⇲ Trasforma")
         tabs.addTab(self._layer_panel,     "🗂 Layer")
         tabs.addTab(self._filter_panel,    "🎨 Filtri")
         tabs.addTab(self._transform_panel, "✂ Ritocchi")
@@ -115,6 +128,19 @@ class MainWindow(QMainWindow):
         self._dock.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._dock)
+
+        # ── Storico visuale (dock separato, nascosto di default) ──────
+        self._history_panel = HistoryPanel()
+        self._history_dock = QDockWidget("Storico", self)
+        self._history_dock.setWidget(self._history_panel)
+        self._history_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea |
+            Qt.DockWidgetArea.BottomDockWidgetArea)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._history_dock)
+        self._history_dock.setVisible(False)
+        self._history_panel.jump_requested.connect(self._on_history_jump)
+        self._history_dock.visibilityChanged.connect(
+            lambda v: self._refresh_history_panel() if v else None)
 
         # ── Segnali canvas ────────────────────────────────────────────
         self._canvas.zoom_changed.connect(self._on_zoom_changed)
@@ -135,6 +161,10 @@ class MainWindow(QMainWindow):
         self._canvas.clone_stroke_end.connect(self._on_clone_end)
         self._canvas.eyedropper_pick.connect(self._on_eyedropper_pick)
         self._canvas.text_anchor_changed.connect(self._on_text_anchor_changed)
+        self._canvas.gradient_applied.connect(self._on_gradient_applied)
+        self._canvas.heal_stroke_begin.connect(self._on_heal_begin)
+        self._canvas.heal_stroke_move.connect(self._on_heal_move)
+        self._canvas.heal_stroke_end.connect(self._on_heal_end)
         self._canvas.file_dropped.connect(self._on_file_dropped)
         self._canvas.image_dropped.connect(self._on_image_dropped)
 
@@ -198,6 +228,11 @@ class MainWindow(QMainWindow):
         self._transform_panel.crop_cancel.connect(
             lambda: self._canvas.end_crop_mode(confirm=False))
 
+        self._adjustment_panel.add_requested.connect(self._on_adj_add)
+        self._adjustment_panel.update_requested.connect(self._on_adj_update)
+        self._free_transform_panel.preview_requested.connect(self._on_ft_preview)
+        self._free_transform_panel.apply_requested.connect(self._on_ft_apply)
+        self._free_transform_panel.reset_requested.connect(self._on_ft_reset)
         self._export_panel.export_requested.connect(self._on_export)
 
         self._build_menu()
@@ -223,7 +258,7 @@ class MainWindow(QMainWindow):
         self._act_proj_open   = self._action("Apri &progetto…",           QKeySequence("Ctrl+Shift+P"),    self._on_project_open)
         self._act_proj_save   = self._action("Sal&va progetto",           QKeySequence("Ctrl+Shift+S"),    self._on_project_save)
         self._act_proj_saveas = self._action("Salva progetto &con nome…", None,                            self._on_project_save_as)
-        self._act_ora_open    = self._action("Apri OpenRaster (.ora)…",   QKeySequence("Ctrl+Shift+R"),    self._on_ora_open)
+        self._act_ora_open    = self._action("Apri OpenRaster (.ora)…",   QKeySequence("Ctrl+Alt+O"),      self._on_ora_open)
         self._act_ora_save    = self._action("Esporta OpenRaster (.ora)…",None,                            self._on_ora_save)
         self._act_save        = self._action("&Salva (piatto)",           QKeySequence.StandardKey.Save,   self._on_save)
         self._act_save_as     = self._action("Salva piatto &con nome…",   QKeySequence.StandardKey.SaveAs, self._on_save_as)
@@ -260,7 +295,7 @@ class MainWindow(QMainWindow):
         layer_menu = mb.addMenu("&Layer")
         layer_menu.addAction(self._action("Nuovo layer",             QKeySequence("Ctrl+Shift+N"), self._on_layer_add))
         layer_menu.addAction(self._action("Nuovo gruppo",            QKeySequence("Ctrl+G"),       self._on_create_group))
-        layer_menu.addAction(self._action("Raggruppa selezione",     QKeySequence("Ctrl+Shift+G"), lambda: self._on_group_node(self._layer_stack.active_path if self._layer_stack else (0,))))
+        layer_menu.addAction(self._action("Raggruppa selezione",     QKeySequence("Ctrl+Alt+G"), lambda: self._on_group_node(self._layer_stack.active_path if self._layer_stack else (0,))))
         layer_menu.addAction(self._action("Scioglie gruppo",         QKeySequence("Ctrl+Shift+U"), lambda: self._on_ungroup(self._layer_stack.active_path if self._layer_stack else (0,))))
         layer_menu.addSeparator()
         layer_menu.addAction(self._action("Appiattisci tutto",       QKeySequence("Ctrl+Shift+F"), self._on_flatten))
@@ -276,6 +311,16 @@ class MainWindow(QMainWindow):
             view_menu.addAction(a) if a else view_menu.addSeparator()
         view_menu.addSeparator()
         view_menu.addAction(self._dock.toggleViewAction())
+        view_menu.addAction(self._history_dock.toggleViewAction())
+        view_menu.addSeparator()
+        self._act_rulers = self._action("&Righelli",          QKeySequence("Ctrl+Shift+R"), self._toggle_rulers)
+        self._act_grid   = self._action("&Griglia",           QKeySequence("Ctrl+Shift+G"), self._toggle_grid)
+        self._act_rulers.setCheckable(True)
+        self._act_grid.setCheckable(True)
+        view_menu.addAction(self._act_rulers)
+        view_menu.addAction(self._act_grid)
+        # Spaziatura griglia
+        view_menu.addAction(self._action("Spaziatura griglia…", None, self._set_grid_spacing))
 
         help_menu = mb.addMenu("&Aiuto")
         help_menu.addAction(self._action("Info", None, self._on_about))
@@ -340,6 +385,7 @@ class MainWindow(QMainWindow):
         self._filter_panel._reset()
         self._set_selection(None)
         self._clone_source_canvas = None
+        self._ft_original_data = None
         self._layer_panel.refresh_from_stack(self._layer_stack)
         self._update_title(); self._update_size_label(array)
         self._update_layer_label(); self._update_actions()
@@ -705,28 +751,36 @@ class MainWindow(QMainWindow):
         prev = self._prev_draw_tool; self._prev_draw_tool = tool
         if prev == "text" and tool != "text":
             self._apply_text(); self._canvas.clear_text_anchor()
-        if prev in ("select_rect","select_ellipse","select_lasso") and                 tool not in ("select_rect","select_ellipse","select_lasso"):
+        if prev in ("select_rect","select_ellipse","select_lasso") and \
+                tool not in ("select_rect","select_ellipse","select_lasso"):
             self._canvas.cancel_selection_mode()
         if prev == "clone" and tool != "clone":
             self._canvas.end_clone_mode()
         if tool and self._canvas.mode == CanvasMode.MOVE:
             self._canvas.set_move_mode(False); self._act_move.setChecked(False)
-        self._canvas.set_draw_mode(tool)
-        is_sel = tool in ("select_rect", "select_ellipse", "select_lasso")
+
+        is_sel   = tool in ("select_rect", "select_ellipse", "select_lasso")
         is_clone = tool == "clone"
-        # Map tool → canvas mode
         if is_sel:
-            shape = tool.replace("select_", "")
-            self._canvas.start_selection_mode(shape)
+            self._canvas.start_selection_mode(tool.replace("select_", ""))
         elif is_clone:
             self._canvas.start_clone_mode()
         else:
             self._canvas.set_draw_mode(tool)
 
-        label_map = {"brush":"🖌 Pennello","eraser":"⬜ Gomma","smudge":"💧 Sfumino",
-                     "eyedropper":"🔍 Contagocce","text":"T Testo",
-                     "select_rect":"⬜ Selezione rettangolare","select_ellipse":"◯ Selezione ellittica",
-                     "select_lasso":"🔗 Lasso","clone":"🔁 Clone"}
+        label_map = {
+            "brush":          "🖌 Pennello",
+            "eraser":         "⬜ Gomma",
+            "smudge":         "💧 Sfumino",
+            "eyedropper":     "🔍 Contagocce",
+            "text":           "T Testo",
+            "select_rect":    "⬜ Selezione rettangolare",
+            "select_ellipse": "◯ Selezione ellittica",
+            "select_lasso":   "🔗 Lasso",
+            "clone":          "🔁 Clone",
+            "gradient":       "🌈 Gradiente",
+            "heal":           "🩹 Guarigione",
+        }
         self._lbl_mode.setText(label_map.get(tool, ""))
         self._update_actions()
 
@@ -773,10 +827,11 @@ class MainWindow(QMainWindow):
         self._last_stroke_pt = None
         self._draw_bg_cache = None
         if self._layer_stack is None: return
-        # Composite completo per il risultato finale
-        self._canvas.update_image(self._layer_stack.composite())
-        self._history.push(self._layer_stack.snapshot())
+        composite = self._layer_stack.composite()
+        self._canvas.update_image(composite)
+        self._history.push(self._layer_stack.snapshot(), composite)
         self._mark_changed(); self._update_actions()
+        self._refresh_history_panel()
 
     def _apply_stamp(self, x: float, y: float) -> None:
         if self._layer_stack is None: return
@@ -888,6 +943,15 @@ class MainWindow(QMainWindow):
         self._layer_stack.set_active_path(path)
         self._layer_panel.refresh_from_stack(self._layer_stack)
         self._update_layer_label()
+        # Se il nodo è un AdjustmentLayer carica i parametri nel pannello
+        try:
+            node = self._layer_stack.get_node(tuple(path))
+            if isinstance(node, AdjustmentLayer):
+                self._adjustment_panel.load_adjustment(node.kind, node.params)
+            else:
+                self._adjustment_panel.reset_ui()
+        except Exception:
+            pass
 
     def _on_layer_visibility_toggled(self, path: tuple) -> None:
         if self._layer_stack is None: return
@@ -1260,9 +1324,176 @@ class MainWindow(QMainWindow):
     def _on_clone_end(self) -> None:
         self._clone_last_dst = None
         if self._layer_stack is None: return
-        self._canvas.update_image(self._layer_stack.composite())
-        self._history.push(self._layer_stack.snapshot())
+        composite = self._layer_stack.composite()
+        self._canvas.update_image(composite)
+        self._history.push(self._layer_stack.snapshot(), composite)
         self._mark_changed(); self._update_actions()
+        self._refresh_history_panel()
+
+    # ── Gradiente ─────────────────────────────────────────────────────
+
+    def _on_gradient_applied(self, x1: float, y1: float, x2: float, y2: float) -> None:
+        if self._layer_stack is None: return
+        layer = self._layer_stack.active
+        c1 = self._drawing_panel.current_color()
+        c2 = self._drawing_panel.gradient_color2
+        color1 = (c1.red(), c1.green(), c1.blue(), c1.alpha())
+        color2 = (c2.red(), c2.green(), c2.blue(), c2.alpha())
+        apply_gradient(
+            layer.data, x1, y1, x2, y2,
+            color1, color2,
+            mode=self._drawing_panel.gradient_mode,
+            opacity=self._drawing_panel.gradient_opacity,
+            selection_mask=self._sel_mask,
+            layer_offset_x=layer.offset_x,
+            layer_offset_y=layer.offset_y,
+        )
+        self._commit()
+
+    # ── Healing brush ─────────────────────────────────────────────────
+
+    def _on_heal_begin(self, x: float, y: float) -> None:
+        if self._layer_stack is None: return
+        layer = self._layer_stack.active
+        h, w = layer.data.shape[:2]
+        self._heal_mask_acc = np.zeros((h, w), dtype=np.uint8)
+        self._accumulate_heal_dab(x - layer.offset_x, y - layer.offset_y)
+
+    def _on_heal_move(self, x: float, y: float) -> None:
+        if self._layer_stack is None or self._heal_mask_acc is None: return
+        layer = self._layer_stack.active
+        self._accumulate_heal_dab(x - layer.offset_x, y - layer.offset_y)
+        # Anteprima: mostra la maschera accumulata come area selezionata
+        self._canvas.viewport().update()
+
+    def _on_heal_end(self) -> None:
+        if self._layer_stack is None or self._heal_mask_acc is None: return
+        layer = self._layer_stack.active
+        if self._heal_mask_acc.any():
+            apply_healing(layer.data, self._heal_mask_acc,
+                          radius=max(3, self._drawing_panel.brush_size // 4))
+            # update_image invece di _commit: non chiama fit_in_view, non causa resize
+            composite = self._layer_stack.composite()
+            self._canvas.update_image(composite)
+            self._history.push(self._layer_stack.snapshot(), composite)
+            self._mark_changed()
+            self._update_actions()
+            self._refresh_history_panel()
+        self._heal_mask_acc = None
+
+    def _accumulate_heal_dab(self, lx: float, ly: float) -> None:
+        """Aggiunge un dab circolare alla maschera heal cumulativa."""
+        if self._layer_stack is None or self._heal_mask_acc is None: return
+        layer = self._layer_stack.active
+        dab = build_heal_mask(layer.data, lx, ly,
+                              self._drawing_panel.brush_size,
+                              self._drawing_panel.hardness / 100.0)
+        np.maximum(self._heal_mask_acc, dab, out=self._heal_mask_acc)
+
+    # ── Storico visuale ───────────────────────────────────────────────
+
+    def _on_history_jump(self, index: int) -> None:
+        snap = self._history.jump_to(index)
+        if snap is None: return
+        self._layer_stack = LayerStack.from_snapshot(snap)
+        self._reset_filter_state()
+        composite = self._layer_stack.composite()
+        self._canvas.update_image(composite)
+        self._layer_panel.refresh_from_stack(self._layer_stack)
+        self._mark_changed(); self._update_layer_label(); self._update_actions()
+        self._refresh_history_panel()
+
+    def _refresh_history_panel(self) -> None:
+        """Aggiorna il pannello storico — solo se visibile (risparmio prestazioni)."""
+        if not self._history_dock.isVisible():
+            return
+        composites = []
+        for c in self._history.composites:
+            if c is None and self._layer_stack is not None:
+                composites.append(self._layer_stack.composite())
+            else:
+                composites.append(c if c is not None else
+                                  np.zeros((4, 4, 4), dtype=np.uint8))
+        self._history_panel.set_history(composites, self._history.current_index)
+
+    # ── Righelli e griglia ────────────────────────────────────────────
+
+    def _toggle_rulers(self) -> None:
+        visible = self._act_rulers.isChecked()
+        self._canvas.set_rulers_visible(visible)
+
+    def _toggle_grid(self) -> None:
+        visible = self._act_grid.isChecked()
+        self._canvas.set_grid_visible(visible)
+
+    def _set_grid_spacing(self) -> None:
+        """Dialogo per spaziatura, colore, spessore griglia + dimensione font righello."""
+        from PyQt6.QtWidgets import (QDialog, QFormLayout, QDialogButtonBox,
+                                     QDoubleSpinBox, QSpinBox, QColorDialog,
+                                     QPushButton as _PB)
+        from PyQt6.QtGui import QColor
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Impostazioni griglia e righello")
+        form = QFormLayout(dlg)
+
+        # Spaziatura griglia
+        spin_spacing = QSpinBox()
+        spin_spacing.setRange(4, 2000)
+        spin_spacing.setValue(self._canvas._grid_spacing)
+        spin_spacing.setSuffix(" px")
+        form.addRow("Spaziatura griglia:", spin_spacing)
+
+        # Spessore linee griglia
+        spin_width = QDoubleSpinBox()
+        spin_width.setRange(0.5, 10.0)
+        spin_width.setSingleStep(0.5)
+        spin_width.setDecimals(1)
+        spin_width.setValue(self._canvas._grid_width)
+        spin_width.setSuffix(" px")
+        form.addRow("Spessore linee:", spin_width)
+
+        # Colore griglia
+        btn_color = _PB()
+        grid_color = QColor(self._canvas._grid_color)
+
+        def _refresh_btn():
+            c = grid_color
+            btn_color.setStyleSheet(
+                f"background:{c.name()}; border:1px solid #555; min-height:22px;")
+            btn_color.setText(f"{c.name()} (α={c.alpha()})")
+
+        _refresh_btn()
+
+        def _pick_color():
+            nonlocal grid_color
+            c = QColorDialog.getColor(
+                grid_color, dlg, "Colore griglia",
+                QColorDialog.ColorDialogOption.ShowAlphaChannel)
+            if c.isValid():
+                grid_color = c
+                _refresh_btn()
+
+        btn_color.clicked.connect(_pick_color)
+        form.addRow("Colore griglia:", btn_color)
+
+        # Font righello
+        spin_font = QSpinBox()
+        spin_font.setRange(6, 20)
+        spin_font.setValue(self._canvas._ruler_font_pt)
+        spin_font.setSuffix(" pt")
+        form.addRow("Font righello:", spin_font)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._canvas.set_grid_spacing(spin_spacing.value())
+            self._canvas.set_grid_style(grid_color, spin_width.value())
+            self._canvas.set_ruler_font_size(spin_font.value())
 
     def _apply_clone_dab(self, dx: float, dy: float) -> None:
         if self._layer_stack is None or self._clone_source_canvas is None: return
@@ -1278,6 +1509,89 @@ class MainWindow(QMainWindow):
         )
         self._canvas.update_image(self._layer_stack.composite())
 
+    # ── Slot Layer di regolazione ────────────────────────────────────
+
+    def _on_adj_add(self, kind: str, params: dict) -> None:
+        if self._layer_stack is None: return
+        kind_names = {
+            "levels": "Livelli", "hsl": "HSL",
+            "color_balance": "Bilanciamento colore",
+            "curves": "Curve", "exposure": "Esposizione",
+        }
+        name = kind_names.get(kind, kind.capitalize())
+        adj = AdjustmentLayer(name=name, kind=kind, params=params)
+        # Inserisce sopra il layer attivo
+        parent_list = self._layer_stack.get_parent_list(self._layer_stack.active_path)
+        insert_at = self._layer_stack.active_path[-1] + 1
+        parent_list.insert(insert_at, adj)
+        self._commit()
+        self.statusBar().showMessage(f"Layer di regolazione «{name}» aggiunto.", 2500)  # type: ignore[union-attr]
+
+    def _on_adj_update(self, params: dict) -> None:
+        """Aggiorna i parametri del nodo selezionato se è un AdjustmentLayer."""
+        if self._layer_stack is None: return
+        try:
+            node = self._layer_stack.get_node(self._layer_stack.active_path)
+        except Exception:
+            return
+        if not isinstance(node, AdjustmentLayer): return
+        import copy
+        node.params = copy.deepcopy(params)
+        # Aggiorna il canvas senza push history (è solo una preview)
+        self._canvas.update_image(self._layer_stack.composite())
+        # Push history
+        self._history.push(self._layer_stack.snapshot())
+        self._mark_changed()
+
+    # ── Slot Trasformazione libera ────────────────────────────────────
+
+    def _on_ft_preview(self, params: dict) -> None:
+        if self._layer_stack is None: return
+        # Salva i dati originali la prima volta
+        if self._ft_original_data is None:
+            self._ft_original_data = self._layer_stack.active.data.copy()
+        data = self._ft_original_data
+        try:
+            preview = apply_transform(
+                data,
+                scale_x=params["scale_x"], scale_y=params["scale_y"],
+                angle_deg=params["angle_deg"],
+                skew_x=params["skew_x"], skew_y=params["skew_y"],
+                expand=params.get("expand", True),
+            )
+        except Exception:
+            return
+        # Mostra anteprima senza committare
+        tmp_stack = self._layer_stack.composite_with_override(
+            self._layer_stack.active_path, preview)
+        self._canvas.update_image(tmp_stack)
+
+    def _on_ft_apply(self, params: dict) -> None:
+        if self._layer_stack is None: return
+        data = self._ft_original_data if self._ft_original_data is not None                else self._layer_stack.active.data
+        try:
+            result = apply_transform(
+                data,
+                scale_x=params["scale_x"], scale_y=params["scale_y"],
+                angle_deg=params["angle_deg"],
+                skew_x=params["skew_x"], skew_y=params["skew_y"],
+                expand=params.get("expand", True),
+            )
+        except Exception as exc:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Errore trasformazione", str(exc)); return
+        self._layer_stack.set_active_data(result)
+        self._ft_original_data = None
+        self._commit()
+        self.statusBar().showMessage("Trasformazione applicata.", 2000)  # type: ignore[union-attr]
+
+    def _on_ft_reset(self) -> None:
+        if self._layer_stack is None: return
+        if self._ft_original_data is not None:
+            self._layer_stack.set_active_data(self._ft_original_data)
+            self._ft_original_data = None
+            self._canvas.update_image(self._layer_stack.composite())
+
     def _on_canvas_cleared(self) -> None:
         self._lbl_pixel.setText("")
 
@@ -1291,13 +1605,14 @@ class MainWindow(QMainWindow):
 
     def _commit(self) -> None:
         if self._layer_stack is None: return
-        self._history.push(self._layer_stack.snapshot())
         composite = self._layer_stack.composite()
+        self._history.push(self._layer_stack.snapshot(), composite)
         self._canvas.set_image(composite)
         self._layer_panel.refresh_from_stack(self._layer_stack)
         self._mark_changed(); self._update_actions(); self._update_layer_label()
         h, w = composite.shape[:2]
         self._lbl_size.setText(f"{w} × {h} px")
+        self._refresh_history_panel()
 
     # ── Helpers ───────────────────────────────────────────────────────
 

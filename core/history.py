@@ -7,16 +7,25 @@ class HistoryManager:
     def __init__(self, max_steps: int = 30) -> None:
         self._max_steps = max_steps
         self._stack: list[dict] = []
+        self._composites: list[np.ndarray] = []   # thumbnail per lo storico visuale
         self._index: int = -1
 
-    def push(self, snapshot: dict) -> None:
+    def push(self, snapshot: dict, composite: np.ndarray | None = None) -> None:
         if self._index < len(self._stack) - 1:
             self._stack = self._stack[:self._index + 1]
+            self._composites = self._composites[:self._index + 1]
         self._stack.append(_deep_copy(snapshot))
+        # Salva una copia ridotta del composite (max 256px lato lungo)
+        if composite is not None:
+            h, w = composite.shape[:2]
+            self._composites.append(composite.copy())
+        else:
+            self._composites.append(None)
         self._index = len(self._stack) - 1
         if len(self._stack) > self._max_steps:
             overflow = len(self._stack) - self._max_steps
             self._stack = self._stack[overflow:]
+            self._composites = self._composites[overflow:]
             self._index = len(self._stack) - 1
 
     def undo(self) -> dict | None:
@@ -29,8 +38,17 @@ class HistoryManager:
         self._index += 1
         return _deep_copy(self._stack[self._index])
 
+    def jump_to(self, index: int) -> dict | None:
+        """Salta direttamente a uno snapshot specifico (usato dallo storico visuale)."""
+        if 0 <= index < len(self._stack):
+            self._index = index
+            return _deep_copy(self._stack[self._index])
+        return None
+
     def clear(self) -> None:
-        self._stack.clear(); self._index = -1
+        self._stack.clear()
+        self._composites.clear()
+        self._index = -1
 
     @property
     def can_undo(self) -> bool: return self._index > 0
@@ -41,6 +59,12 @@ class HistoryManager:
         return _deep_copy(self._stack[self._index]) if self._index >= 0 else None
     @property
     def steps_count(self) -> int: return len(self._stack)
+    @property
+    def current_index(self) -> int: return self._index
+    @property
+    def composites(self) -> list:
+        """Lista dei composites salvati (alcuni possono essere None)."""
+        return self._composites
 
 
 def _deep_copy(snap: dict) -> dict:
@@ -52,6 +76,7 @@ def _deep_copy(snap: dict) -> dict:
 
 
 def _deep_copy_node(d: dict) -> dict:
+    import copy
     if d.get("_type") == "group":
         return {
             "_type": "group",
@@ -60,6 +85,17 @@ def _deep_copy_node(d: dict) -> dict:
             "visible": d["visible"],
             "opacity": d["opacity"],
             "blend_mode": d["blend_mode"],
+        }
+    if d.get("_type") == "adjustment":
+        return {
+            "_type": "adjustment",
+            "name": d["name"],
+            "kind": d["kind"],
+            "params": copy.deepcopy(d.get("params", {})),
+            "visible": d.get("visible", True),
+            "opacity": d.get("opacity", 1.0),
+            "blend_mode": d.get("blend_mode", "normal"),
+            "mask": d["mask"].copy() if d.get("mask") is not None else None,
         }
     # Layer foglia
     return {
