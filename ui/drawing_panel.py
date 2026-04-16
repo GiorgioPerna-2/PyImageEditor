@@ -26,6 +26,7 @@ TOOLS = [
     ("clone",          "🔁",    "Timbro clone [C]"),
     ("gradient",       "🌈",    "Gradiente [G]"),
     ("heal",           "🩹",    "Guarigione [H]"),
+    ("magic_wand",     "🪄",    "Bacchetta magica [W]"),
 ]
 
 
@@ -290,6 +291,30 @@ class DrawingPanel(QWidget):
         self._grad_box.setVisible(False)
         root.addWidget(self._grad_box)
 
+        # ── Sezione Bacchetta magica ───────────────────────────────────
+        self._wand_box = QGroupBox("Bacchetta magica")
+        wand_layout = QVBoxLayout(self._wand_box)
+        tol_row = QHBoxLayout()
+        tol_row.addWidget(QLabel("Tolleranza:"))
+        self._wand_tol_slider = QSlider(Qt.Orientation.Horizontal)
+        self._wand_tol_slider.setRange(0, 255)
+        self._wand_tol_slider.setValue(32)
+        self._lbl_wand_tol = QLabel("32")
+        self._lbl_wand_tol.setMinimumWidth(30)
+        self._wand_tol_slider.valueChanged.connect(
+            lambda v: self._lbl_wand_tol.setText(str(v)))
+        tol_row.addWidget(self._wand_tol_slider)
+        tol_row.addWidget(self._lbl_wand_tol)
+        wand_layout.addLayout(tol_row)
+        self._wand_contiguous = QCheckBox("Solo area contigua")
+        self._wand_contiguous.setChecked(True)
+        wand_layout.addWidget(self._wand_contiguous)
+        self._wand_antialias = QCheckBox("Anti-alias bordi")
+        self._wand_antialias.setChecked(True)
+        wand_layout.addWidget(self._wand_antialias)
+        self._wand_box.setVisible(False)
+        root.addWidget(self._wand_box)
+
         root.addStretch()
 
     # ── Public API ────────────────────────────────────────────────────
@@ -325,6 +350,16 @@ class DrawingPanel(QWidget):
         if hasattr(self, "_grad_opacity_slider"):
             return self._grad_opacity_slider.value() / 100.0
         return 1.0
+
+    @property
+    def wand_tolerance(self) -> int:
+        return self._wand_tol_slider.value() if hasattr(self, "_wand_tol_slider") else 32
+    @property
+    def wand_contiguous(self) -> bool:
+        return self._wand_contiguous.isChecked() if hasattr(self, "_wand_contiguous") else True
+    @property
+    def wand_anti_alias(self) -> bool:
+        return self._wand_antialias.isChecked() if hasattr(self, "_wand_antialias") else True
 
     @property
     def text_content(self) -> str: return self._txt_input.text()
@@ -371,6 +406,7 @@ class DrawingPanel(QWidget):
         is_eye    = self._active_tool == "eyedropper"
         is_select = self._active_tool in ("select_rect", "select_ellipse", "select_lasso")
         is_grad   = self._active_tool == "gradient"
+        is_wand   = self._active_tool == "magic_wand"
 
         self._size_box.setVisible(is_draw or is_clone)
         self._hard_box.setVisible(is_draw or is_clone)
@@ -382,6 +418,8 @@ class DrawingPanel(QWidget):
             self._clone_hint.setVisible(is_clone)
         if hasattr(self, "_grad_box"):
             self._grad_box.setVisible(is_grad)
+        if hasattr(self, "_wand_box"):
+            self._wand_box.setVisible(is_wand)
 
         if self._active_tool == "smudge":
             self._hard_box.setTitle("Intensità sfumino")

@@ -35,6 +35,7 @@ class CanvasMode(Enum):
     CLONE          = auto()
     GRADIENT       = auto()
     HEAL           = auto()
+    MAGIC_WAND     = auto()
 
 
 class _Handle(Enum):
@@ -94,6 +95,8 @@ class ImageCanvas(QGraphicsView):
 
     # Gradiente: x1,y1,x2,y2 coordinate scena al rilascio
     gradient_applied = pyqtSignal(float, float, float, float)
+    # Bacchetta magica: x,y in coordinate scena al click
+    magic_wand_clicked = pyqtSignal(float, float)
     # Healing brush: stesse porte del pennello
     heal_stroke_begin = pyqtSignal(float, float)
     heal_stroke_move  = pyqtSignal(float, float)
@@ -336,6 +339,7 @@ class ImageCanvas(QGraphicsView):
             "text":       CanvasMode.TEXT,
             "gradient":   CanvasMode.GRADIENT,
             "heal":       CanvasMode.HEAL,
+            "magic_wand": CanvasMode.MAGIC_WAND,
         }
         self._mode = _map.get(tool, CanvasMode.NORMAL)
         self._drawing = False
@@ -351,6 +355,7 @@ class ImageCanvas(QGraphicsView):
             CanvasMode.EYEDROPPER: Qt.CursorShape.CrossCursor,
             CanvasMode.TEXT:       Qt.CursorShape.IBeamCursor,
             CanvasMode.GRADIENT:   Qt.CursorShape.CrossCursor,
+            CanvasMode.MAGIC_WAND: Qt.CursorShape.CrossCursor,
         }
         self.setCursor(cursor_map.get(self._mode, Qt.CursorShape.ArrowCursor))
         self.viewport().update()
@@ -505,6 +510,10 @@ class ImageCanvas(QGraphicsView):
                 h, w = self._image_array.shape[:2]
                 if 0 <= x < w and 0 <= y < h:
                     self.eyedropper_pick.emit(x, y)
+            return
+
+        if self._mode == CanvasMode.MAGIC_WAND and event.button() == Qt.MouseButton.LeftButton:
+            self.magic_wand_clicked.emit(sp.x(), sp.y())
             return
 
         if self._mode == CanvasMode.TEXT and event.button() == Qt.MouseButton.LeftButton:
@@ -805,6 +814,10 @@ class ImageCanvas(QGraphicsView):
             self._draw_badge(painter, "🔍 Contagocce — clicca per prelevare il colore",
                              QColor(100, 220, 100))
 
+        if self._mode == CanvasMode.MAGIC_WAND:
+            self._draw_badge(painter, "🪄 Bacchetta magica — clicca per selezionare per colore",
+                             QColor(255, 220, 40))
+
         if self._mode == CanvasMode.GRABCUT:
             self._draw_badge(painter, "✂ GrabCut — disegna un rettangolo (Invio=applica, Esc=annulla)",
                              QColor(60, 220, 100))
@@ -1006,16 +1019,18 @@ class ImageCanvas(QGraphicsView):
         painter.setFont(font)
 
         if text:
-            # Anteprima testo
-            painter.setPen(QPen(color))
-            painter.drawText(QPointF(ax, ay), text)
-
-            # Rettangolo tratteggiato intorno al testo
             fm = painter.fontMetrics()
             tw = fm.horizontalAdvance(text)
             th = fm.height()
-            margin = 4
-            rect = QRectF(ax - margin, ay - fm.ascent() - margin,
+            margin = 2
+
+            # Disegna il testo con baseline a ay + ascent
+            # così il top del glifo è a ay, coerente con Pillow (x,y) = top-left
+            painter.setPen(QPen(color))
+            painter.drawText(QPointF(ax, ay + fm.ascent()), text)
+
+            # Rettangolo tratteggiato allineato al top-left (ax, ay)
+            rect = QRectF(ax - margin, ay - margin,
                           tw + margin * 2, th + margin * 2)
             pen = QPen(QColor(160, 120, 255, 200), 1.5)
             pen.setStyle(Qt.PenStyle.DashLine)

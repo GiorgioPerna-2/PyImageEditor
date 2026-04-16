@@ -37,6 +37,9 @@ from ui.free_transform_panel import FreeTransformPanel
 from core.layer import AdjustmentLayer
 from core.free_transform import apply_transform
 from ui.history_panel import HistoryPanel
+from ui.upscale_panel import UpscalePanel, _UpscaleWorker
+from core.magic_wand import magic_wand_select
+from core.raw_io import is_raw, load_raw, RAW_EXTENSIONS
 
 
 class _RembgWorker(QObject):
@@ -60,6 +63,52 @@ class _RembgWorker(QObject):
             result = remove_background_rembg(
                 self._arr, self._model, self._am, self._fg, self._bg, self._er)
             self.done.emit(result)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class _MagicWandWorker(QObject):
+    """Esegue magic_wand_select in un QThread separato per non bloccare la UI."""
+    done  = pyqtSignal(object)   # np.ndarray bool (H, W)
+    error = pyqtSignal(str)
+
+    def __init__(self,
+                 rgba: np.ndarray,
+                 lx: int, ly: int,
+                 offset_x: int, offset_y: int,
+                 canvas_w: int, canvas_h: int,
+                 tolerance: int, contiguous: bool, anti_alias: bool) -> None:
+        super().__init__()
+        self._rgba      = rgba
+        self._lx        = lx
+        self._ly        = ly
+        self._ox        = offset_x
+        self._oy        = offset_y
+        self._cw        = canvas_w
+        self._ch        = canvas_h
+        self._tolerance = tolerance
+        self._contiguous = contiguous
+        self._anti_alias = anti_alias
+
+    def run(self) -> None:
+        try:
+            mask_layer = magic_wand_select(
+                self._rgba, self._lx, self._ly,
+                tolerance=self._tolerance,
+                contiguous=self._contiguous,
+                anti_alias=self._anti_alias,
+            )
+            lh, lw = self._rgba.shape[:2]
+            mask_canvas = np.zeros((self._ch, self._cw), dtype=bool)
+            cy0 = max(0, self._oy)
+            cx0 = max(0, self._ox)
+            cy1 = min(self._ch, self._oy + lh)
+            cx1 = min(self._cw, self._ox + lw)
+            ly0 = cy0 - self._oy
+            lx0 = cx0 - self._ox
+            mask_canvas[cy0:cy1, cx0:cx1] = mask_layer[
+                ly0:ly0 + (cy1 - cy0), lx0:lx0 + (cx1 - cx0)]
+            self.done.emit(mask_canvas)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -99,6 +148,8 @@ class MainWindow(QMainWindow):
         self._rembg_thread: QThread | None = None
         self._rembg_worker: _RembgWorker | None = None
         self._heal_mask_acc: np.ndarray | None = None   # maschera cumulativa del tratto heal
+        self._wand_thread:  QThread | None = None
+        self._wand_worker:  _MagicWandWorker | None = None
 
         self._canvas = ImageCanvas()
         self.setCentralWidget(self._canvas)
@@ -111,17 +162,19 @@ class MainWindow(QMainWindow):
         self._matting_panel      = MattingPanel()
         self._adjustment_panel   = AdjustmentPanel()
         self._free_transform_panel = FreeTransformPanel()
+        self._upscale_panel      = UpscalePanel()
 
         tabs = QTabWidget()
         tabs.setMinimumWidth(290)
-        tabs.addTab(self._drawing_panel,   "✏ Disegno")
-        tabs.addTab(self._matting_panel,      "✂ Scontorna")
-        tabs.addTab(self._adjustment_panel,   "⚙ Regolazioni")
+        tabs.addTab(self._drawing_panel,        "✏ Disegno")
+        tabs.addTab(self._matting_panel,        "✂ Scontorna")
+        tabs.addTab(self._adjustment_panel,     "⚙ Regolazioni")
         tabs.addTab(self._free_transform_panel, "⇲ Trasforma")
-        tabs.addTab(self._layer_panel,     "🗂 Layer")
-        tabs.addTab(self._filter_panel,    "🎨 Filtri")
-        tabs.addTab(self._transform_panel, "✂ Ritocchi")
-        tabs.addTab(self._export_panel,    "💾 Esporta")
+        tabs.addTab(self._upscale_panel,        "🔍 Upscale")
+        tabs.addTab(self._layer_panel,          "🗂 Layer")
+        tabs.addTab(self._filter_panel,         "🎨 Filtri")
+        tabs.addTab(self._transform_panel,      "✂ Ritocchi")
+        tabs.addTab(self._export_panel,         "💾 Esporta")
 
         self._dock = QDockWidget("Strumenti", self)
         self._dock.setWidget(tabs)
@@ -167,6 +220,12 @@ class MainWindow(QMainWindow):
         self._canvas.heal_stroke_end.connect(self._on_heal_end)
         self._canvas.file_dropped.connect(self._on_file_dropped)
         self._canvas.image_dropped.connect(self._on_image_dropped)
+        self._canvas.magic_wand_clicked.connect(self._on_magic_wand_click)
+        self._upscale_panel.upscale_requested.connect(self._on_upscale_requested)
+
+        # Stato upscale thread
+        self._upscale_thread: QThread | None = None
+        self._upscale_worker: _UpscaleWorker | None = None
 
         # ── Segnali pannello disegno ──────────────────────────────────
         self._drawing_panel.tool_changed.connect(self._on_draw_tool_changed)
@@ -368,11 +427,21 @@ class MainWindow(QMainWindow):
 
     def _on_open(self) -> None:
         if not self._check_unsaved(): return
+        raw_exts = " ".join(f"*{e}" for e in sorted(RAW_EXTENSIONS))
         path, _ = QFileDialog.getOpenFileName(self, "Apri immagine", "",
-            "Immagini (*.png *.jpg *.jpeg *.webp *.tiff *.tif *.bmp *.gif)")
+            f"Tutti i supportati (*.png *.jpg *.jpeg *.webp *.tiff *.tif *.bmp *.gif {raw_exts});;"
+            f"Immagini (*.png *.jpg *.jpeg *.webp *.tiff *.tif *.bmp *.gif);;"
+            f"File RAW ({raw_exts})")
         if not path: return
         try:
-            array = load_image(path)
+            if is_raw(path):
+                array = load_raw(path)
+            else:
+                array = load_image(path)
+        except ImportError as exc:
+            QMessageBox.warning(self, "rawpy non installato",
+                str(exc) + "\n\nPuoi installarlo con:\n  pip install rawpy")
+            return
         except Exception as exc:
             QMessageBox.critical(self, "Errore", str(exc)); return
         self._current_path = FilePath(path)
@@ -756,6 +825,8 @@ class MainWindow(QMainWindow):
             self._canvas.cancel_selection_mode()
         if prev == "clone" and tool != "clone":
             self._canvas.end_clone_mode()
+        if prev == "magic_wand" and tool != "magic_wand":
+            self._cancel_wand_thread()
         if tool and self._canvas.mode == CanvasMode.MOVE:
             self._canvas.set_move_mode(False); self._act_move.setChecked(False)
 
@@ -780,6 +851,7 @@ class MainWindow(QMainWindow):
             "clone":          "🔁 Clone",
             "gradient":       "🌈 Gradiente",
             "heal":           "🩹 Guarigione",
+            "magic_wand":     "🪄 Bacchetta magica",
         }
         self._lbl_mode.setText(label_map.get(tool, ""))
         self._update_actions()
@@ -1389,6 +1461,119 @@ class MainWindow(QMainWindow):
                               self._drawing_panel.brush_size,
                               self._drawing_panel.hardness / 100.0)
         np.maximum(self._heal_mask_acc, dab, out=self._heal_mask_acc)
+
+    # ── Bacchetta magica ──────────────────────────────────────────────
+
+    def _on_magic_wand_click(self, x: float, y: float) -> None:
+        if self._layer_stack is None: return
+        if self._wand_thread is not None: return  # elaborazione già in corso
+        layer = self._layer_stack.active
+        if not isinstance(layer, Layer): return
+
+        # Coordinate canvas → layer
+        lx = int(x - layer.offset_x)
+        ly = int(y - layer.offset_y)
+        lh, lw = layer.data.shape[:2]
+        if not (0 <= lx < lw and 0 <= ly < lh): return
+
+        dp = self._drawing_panel
+        cw, ch = self._layer_stack.canvas_size
+
+        self._wand_worker = _MagicWandWorker(
+            layer.data.copy(),          # copia per thread-safety
+            lx, ly,
+            layer.offset_x, layer.offset_y,
+            cw, ch,
+            dp.wand_tolerance,
+            dp.wand_contiguous,
+            dp.wand_anti_alias,
+        )
+        self._wand_thread = QThread(self)
+        self._wand_worker.moveToThread(self._wand_thread)
+
+        self._wand_thread.started.connect(self._wand_worker.run)
+        self._wand_worker.done.connect(self._on_wand_done)
+        self._wand_worker.error.connect(self._on_wand_error)
+        self._wand_worker.done.connect(self._wand_thread.quit)
+        self._wand_worker.error.connect(self._wand_thread.quit)
+        self._wand_thread.finished.connect(self._wand_worker.deleteLater)
+        self._wand_thread.finished.connect(self._wand_thread.deleteLater)
+        self._wand_thread.finished.connect(self._wand_cleanup)
+
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        self.statusBar().showMessage("🪄 Selezione in corso…", 0)  # type: ignore[union-attr]
+        self._wand_thread.start()
+
+    def _on_wand_done(self, mask_canvas: np.ndarray) -> None:
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._set_selection(mask_canvas)
+        px = int(mask_canvas.sum())
+        self.statusBar().showMessage(f"🪄 Selezionati {px} pixel", 2000)  # type: ignore[union-attr]
+
+    def _on_wand_error(self, msg: str) -> None:
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.statusBar().showMessage(f"🪄 Errore selezione: {msg}", 3000)  # type: ignore[union-attr]
+
+    def _wand_cleanup(self) -> None:
+        self._wand_thread = None
+        self._wand_worker = None
+
+    def _cancel_wand_thread(self) -> None:
+        """Interrompe il thread della bacchetta magica se attivo."""
+        if self._wand_thread is not None:
+            self._wand_thread.quit()
+            self._wand_thread.wait(500)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    # ── Upscaling ESRGAN ──────────────────────────────────────────────
+
+    def _on_upscale_requested(self, model_name: str) -> None:
+        if self._layer_stack is None:
+            QMessageBox.information(self, "Upscale", "Apri prima un'immagine.")
+            return
+        if self._upscale_thread is not None:
+            QMessageBox.information(self, "Upscale", "Upscaling già in corso.")
+            return
+        layer = self._layer_stack.active
+        if not isinstance(layer, Layer):
+            QMessageBox.information(self, "Upscale",
+                "Seleziona un layer immagine (non un layer di regolazione).")
+            return
+        array = layer.data.copy()
+        self._upscale_worker = _UpscaleWorker(array, model_name)
+        self._upscale_thread = QThread(self)
+        self._upscale_worker.moveToThread(self._upscale_thread)
+        self._upscale_thread.started.connect(self._upscale_worker.run)
+        self._upscale_worker.progress.connect(self._upscale_panel.set_status)
+        self._upscale_worker.done.connect(self._on_upscale_done)
+        self._upscale_worker.error.connect(self._on_upscale_error)
+        self._upscale_worker.done.connect(self._upscale_thread.quit)
+        self._upscale_worker.error.connect(self._upscale_thread.quit)
+        self._upscale_thread.finished.connect(self._upscale_worker.deleteLater)
+        self._upscale_thread.finished.connect(self._upscale_thread.deleteLater)
+        self._upscale_thread.finished.connect(self._upscale_cleanup)
+        self._upscale_thread.start()
+        self._upscale_panel.set_busy(True)
+
+    def _on_upscale_done(self, result: np.ndarray) -> None:
+        if self._layer_stack is None: return
+        self._layer_stack.set_active_data(result)
+        # Aggiorna canvas_size se la dimensione è cambiata
+        h, w = result.shape[:2]
+        self._layer_stack._canvas_w = w
+        self._layer_stack._canvas_h = h
+        self._commit()
+        self._upscale_panel.set_status("✓ Upscaling completato.")
+        self._upscale_panel.refresh_cache_status()
+
+    def _on_upscale_error(self, msg: str) -> None:
+        QMessageBox.critical(self, "Errore upscaling", msg)
+        self._upscale_panel.set_status(f"Errore: {msg}")
+
+    def _upscale_cleanup(self) -> None:
+        self._upscale_thread = None
+        self._upscale_worker = None
+        self._upscale_panel.set_busy(False)
 
     # ── Storico visuale ───────────────────────────────────────────────
 

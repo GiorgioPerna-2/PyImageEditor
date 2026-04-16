@@ -293,8 +293,14 @@ def draw_text(
     tmp_img = Image.new("RGBA", (1, 1))
     tmp_draw = ImageDraw.Draw(tmp_img)
     bbox = tmp_draw.textbbox((0, 0), text, font=font)
+    # bbox = (left, top, right, bottom) — top è spesso negativo (ascent)
+    bx, by = bbox[0], bbox[1]
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
+
+    # Porta (x,y) al top-left reale del testo compensando l'offset del font
+    tx = x - bx   # offset orizzontale (di solito 0)
+    ty = y - by   # compensa l'ascent (top negativo)
 
     # Area di rendering (clippata al canvas)
     rx = max(0, x);  ry = max(0, y)
@@ -306,8 +312,7 @@ def draw_text(
     pw = rx2 - rx;  ph = ry2 - ry
     patch_img = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
     draw = ImageDraw.Draw(patch_img)
-    draw.text((0 - (rx - x), 0 - (ry - y)), text, font=font,
-              fill=color_rgba)
+    draw.text((tx - rx, ty - ry), text, font=font, fill=color_rgba)
 
     patch_arr = np.array(patch_img, dtype=np.uint8)
     existing = data[ry:ry2, rx:rx2].astype(np.float32)
