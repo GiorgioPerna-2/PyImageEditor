@@ -14,18 +14,48 @@ from __future__ import annotations
 from pathlib import Path
 import numpy as np
 
-# Estensioni RAW comuni
+# Estensioni RAW — copertura equivalente a GIMP (LibRaw) e Photoshop (Camera Raw)
 RAW_EXTENSIONS = {
-    ".cr2", ".cr3",           # Canon
-    ".nef", ".nrw",           # Nikon
-    ".arw", ".srf", ".sr2",   # Sony
-    ".dng",                   # Adobe DNG
-    ".raf",                   # Fujifilm
-    ".rw2",                   # Panasonic
-    ".orf",                   # Olympus
-    ".pef",                   # Pentax
-    ".x3f",                   # Sigma
-    ".raw", ".rwl",           # Leica / generico
+    # Canon
+    ".cr2", ".cr3", ".crw", ".ciff",
+    # Nikon
+    ".nef", ".nrw",
+    # Sony
+    ".arw", ".srf", ".sr2",
+    # Adobe
+    ".dng",
+    # Fujifilm
+    ".raf",
+    # Panasonic / Lumix
+    ".rw2", ".raw",
+    # Olympus / OM System
+    ".orf",
+    # Pentax / Ricoh
+    ".pef", ".ptx", ".dng",
+    # Sigma
+    ".x3f",
+    # Leica
+    ".rwl", ".lrw", ".raw",
+    # Hasselblad
+    ".3fr", ".fff",
+    # Phase One / Leaf
+    ".iiq", ".cap", ".eip",
+    # Mamiya
+    ".mef", ".mfw",
+    # Minolta / Konica-Minolta
+    ".mrw", ".mdc",
+    # Kodak
+    ".dcr", ".kdc", ".k25", ".dcs",
+    # Epson
+    ".erf",
+    # Casio
+    ".bay",
+    # Samsung
+    ".srw",
+    # Blackmagic
+    ".braw",   # rawpy supporta braw tramite plugin
+    # Generico
+    ".raw",
 }
 
 

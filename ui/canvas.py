@@ -7,9 +7,11 @@ import numpy as np
 from PyQt6.QtCore import Qt, QRectF, QPointF, QPoint, pyqtSignal
 from PyQt6.QtGui import (
     QImage, QPixmap, QWheelEvent, QMouseEvent, QKeyEvent,
-    QPainter, QPen, QColor, QBrush, QFont, QFontMetrics,
+    QPainter, QPen, QColor, QBrush, QFont, QFontMetrics, QPainterPath,
 )
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
+from core.drawing_engine import render_text_patch
+from core.shapes import Shape, Handle, HandleID
 
 MIN_ZOOM = 0.05
 MAX_ZOOM = 32.0
@@ -36,6 +38,7 @@ class CanvasMode(Enum):
     GRADIENT       = auto()
     HEAL           = auto()
     MAGIC_WAND     = auto()
+    SHAPE          = auto()
 
 
 class _Handle(Enum):
@@ -97,6 +100,10 @@ class ImageCanvas(QGraphicsView):
     gradient_applied = pyqtSignal(float, float, float, float)
     # Bacchetta magica: x,y in coordinate scena al click
     magic_wand_clicked = pyqtSignal(float, float)
+    # Forme: posizionamento iniziale e drag handle
+    shape_placed       = pyqtSignal(float, float)   # click → cx,cy
+    shape_handle_drag  = pyqtSignal(int, float, float)  # HandleID.value, dx, dy
+    shape_apply        = pyqtSignal()               # applica sul layer
     # Healing brush: stesse porte del pennello
     heal_stroke_begin = pyqtSignal(float, float)
     heal_stroke_move  = pyqtSignal(float, float)
@@ -134,6 +141,14 @@ class ImageCanvas(QGraphicsView):
         self._text_anchor: Optional[QPointF] = None  # scene coords
         self._text_dragging = False
         self._text_preview: dict = {}   # text, font_family, font_size, bold, italic, color
+
+        # Shape state
+        self._shape_current: Optional[Shape] = None   # forma corrente (da main_window)
+        self._shape_drag_handle: Optional[Handle] = None
+        self._shape_drag_last:   Optional[QPointF] = None
+        self._shape_preview_pos: Optional[QPointF] = None  # cursore per anteprima ghost
+        self._shape_ghost_kind  = None   # ShapeKind corrente (per ghost pre-click)
+        _HANDLE_HIT = 12   # px viewport
 
         # Selezione stato
         self._sel_start: Optional[QPointF] = None      # scene coords, primo click
@@ -241,6 +256,47 @@ class ImageCanvas(QGraphicsView):
         self._image_array = array
         self._pixmap_item.setPixmap(self._to_pixmap(array))
 
+    def update_image_patch(
+        self,
+        array:    np.ndarray,
+        cx0: int, cy0: int,
+        cx1: int, cy1: int,
+    ) -> None:
+        """
+        Aggiorna SOLO il rettangolo [cy0:cy1, cx0:cx1] del QPixmap corrente,
+        riducendo il trasferimento da O(W×H) a O(brush_size²).
+
+        array deve essere il canvas completo (già aggiornato in-place da
+        fast_composite_patch); viene usato solo per leggere il patch.
+        """
+        self._image_array = array
+        existing = self._pixmap_item.pixmap()
+        if existing.isNull():
+            # Primo frame o reset: init completo
+            self._pixmap_item.setPixmap(self._to_pixmap(array))
+            return
+
+        h, w = array.shape[:2]
+        # Clippa ai bordi del canvas
+        x0 = max(0, cx0);  y0 = max(0, cy0)
+        x1 = min(w, cx1);  y1 = min(h, cy1)
+        if x0 >= x1 or y0 >= y1:
+            return
+
+        pw, ph = x1 - x0, y1 - y0
+        patch = array[y0:y1, x0:x1]
+        # Crea QImage solo per il patch (piccolo) — no tobytes() sull'intera immagine
+        patch_qi = QImage(
+            patch.tobytes(), pw, ph, pw * 4,
+            QImage.Format.Format_RGBA8888)
+
+        # Disegna il patch sul QPixmap esistente in-place
+        pm = existing
+        painter = QPainter(pm)
+        painter.drawImage(x0, y0, patch_qi)
+        painter.end()
+        self._pixmap_item.setPixmap(pm)
+
     def get_image(self) -> Optional[np.ndarray]:
         return self._image_array
 
@@ -340,6 +396,7 @@ class ImageCanvas(QGraphicsView):
             "gradient":   CanvasMode.GRADIENT,
             "heal":       CanvasMode.HEAL,
             "magic_wand": CanvasMode.MAGIC_WAND,
+            "shape":      CanvasMode.SHAPE,
         }
         self._mode = _map.get(tool, CanvasMode.NORMAL)
         self._drawing = False
@@ -356,6 +413,7 @@ class ImageCanvas(QGraphicsView):
             CanvasMode.TEXT:       Qt.CursorShape.IBeamCursor,
             CanvasMode.GRADIENT:   Qt.CursorShape.CrossCursor,
             CanvasMode.MAGIC_WAND: Qt.CursorShape.CrossCursor,
+            CanvasMode.SHAPE:      Qt.CursorShape.CrossCursor,
         }
         self.setCursor(cursor_map.get(self._mode, Qt.CursorShape.ArrowCursor))
         self.viewport().update()
@@ -390,11 +448,20 @@ class ImageCanvas(QGraphicsView):
     # ── API testo ─────────────────────────────────────────────────────
 
     def set_text_preview(self, text: str, font_family: str, font_size: int,
-                         bold: bool, italic: bool, color: QColor) -> None:
+                         bold: bool, italic: bool, color: QColor,
+                         opacity: float = 1.0,
+                         effect: str = "none",
+                         effect_color: QColor = None,
+                         outline_width: int = 2) -> None:
         """Aggiorna i parametri del testo di anteprima senza spostare l'ancora."""
-        self._text_preview = dict(text=text, font_family=font_family,
-                                  font_size=font_size, bold=bold,
-                                  italic=italic, color=QColor(color))
+        self._text_preview = dict(
+            text=text, font_family=font_family,
+            font_size=font_size, bold=bold, italic=italic,
+            color=QColor(color),
+            opacity=opacity, effect=effect,
+            effect_color=QColor(effect_color) if effect_color else QColor(0, 0, 0, 200),
+            outline_width=outline_width,
+        )
         self.viewport().update()
 
     def get_text_anchor(self) -> Optional[tuple[float, float]]:
@@ -405,7 +472,44 @@ class ImageCanvas(QGraphicsView):
         self._text_anchor = None
         self.viewport().update()
 
-    # ── API selezione ────────────────────────────────────────────────
+    # ── API forme ─────────────────────────────────────────────────────
+
+    def set_shape(self, shape: Optional[Shape]) -> None:
+        """Imposta una nuova forma (o None). Resetta lo stato drag."""
+        self._shape_current     = shape
+        self._shape_drag_handle = None   # reset solo quando si cambia forma
+        self._shape_drag_last   = None
+        self.viewport().update()
+
+    def refresh_shape(self) -> None:
+        """Ridisegna la forma corrente SENZA toccare lo stato drag.
+        Usato da _on_shape_handle_drag per aggiornare il visual durante il drag."""
+        self.viewport().update()
+
+    def set_shape_ghost_kind(self, kind) -> None:
+        """Aggiorna il tipo di forma per l'anteprima ghost pre-click."""
+        self._shape_ghost_kind = kind
+        self.viewport().update()
+
+    def get_shape(self) -> Optional[Shape]:
+        return self._shape_current
+
+    def _shape_hit_handle(self, vp: QPointF) -> Optional[Handle]:
+        """Restituisce l'handle più vicino al punto viewport, entro HIT_RADIUS."""
+        HIT = 14  # px viewport
+        if self._shape_current is None:
+            return None
+        best: Optional[Handle] = None
+        best_d = HIT * HIT
+        for h in self._shape_current.handles():
+            if not h.visible:
+                continue
+            # Converti posizione handle (scene) → viewport
+            hvp = self.mapFromScene(h.pos)
+            d2  = (hvp.x() - vp.x())**2 + (hvp.y() - vp.y())**2
+            if d2 < best_d:
+                best_d = d2; best = h
+        return best
 
     def start_selection_mode(self, shape: str) -> None:
         """shape = 'rect' | 'ellipse' | 'lasso'"""
@@ -514,6 +618,18 @@ class ImageCanvas(QGraphicsView):
 
         if self._mode == CanvasMode.MAGIC_WAND and event.button() == Qt.MouseButton.LeftButton:
             self.magic_wand_clicked.emit(sp.x(), sp.y())
+            return
+
+        if self._mode == CanvasMode.SHAPE and event.button() == Qt.MouseButton.LeftButton:
+            hit = self._shape_hit_handle(vp)
+            if hit is not None:
+                # Inizia drag handle — salva posizione in coordinate SCENA
+                self._shape_drag_handle = hit
+                self._shape_drag_last   = QPointF(sp)   # SCENA, non viewport
+                self.setCursor(hit.cursor)
+            else:
+                # Nessun handle → posiziona una nuova forma
+                self.shape_placed.emit(sp.x(), sp.y())
             return
 
         if self._mode == CanvasMode.TEXT and event.button() == Qt.MouseButton.LeftButton:
@@ -638,6 +754,24 @@ class ImageCanvas(QGraphicsView):
             self.viewport().update()
             return
 
+        if self._mode == CanvasMode.SHAPE:
+            self._shape_preview_pos = QPointF(sp)   # aggiorna pos ghost
+            if self._shape_drag_handle is not None and self._shape_drag_last is not None:
+                # Delta direttamente in coordinate scena (= px immagine) — no zoom
+                dx = sp.x() - self._shape_drag_last.x()
+                dy = sp.y() - self._shape_drag_last.y()
+                self._shape_drag_last = QPointF(sp)   # aggiorna in SCENA
+                self.shape_handle_drag.emit(self._shape_drag_handle.id.value, dx, dy)
+            else:
+                # Aggiorna cursore se siamo sopra un handle
+                hit = self._shape_hit_handle(vp)
+                if hit:
+                    self.setCursor(hit.cursor)
+                else:
+                    self.setCursor(Qt.CursorShape.CrossCursor)
+            self.viewport().update()
+            return
+
         if self._mode in (CanvasMode.SELECT_RECT, CanvasMode.SELECT_ELLIPSE):
             if self._sel_start is not None:
                 self._sel_rect = QRectF(self._sel_start, sp).normalized()
@@ -706,6 +840,13 @@ class ImageCanvas(QGraphicsView):
         if self._mode == CanvasMode.TEXT:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._text_dragging = False
+            return
+
+        if self._mode == CanvasMode.SHAPE:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._shape_drag_handle = None
+                self._shape_drag_last   = None
+                self.setCursor(Qt.CursorShape.CrossCursor)
             return
 
         if self._mode in (CanvasMode.SELECT_RECT, CanvasMode.SELECT_ELLIPSE):
@@ -855,6 +996,11 @@ class ImageCanvas(QGraphicsView):
             self._draw_brush_cursor(painter)
             self._draw_badge(painter, "🩹 Guarigione — dipingi sull'area da riparare", QColor(80, 200, 130))
 
+        # Forme — overlay interattivo
+        if self._mode == CanvasMode.SHAPE:
+            self._draw_shape_overlay(painter)
+            self._draw_badge(painter, "⬟ Forme — clicca per inserire, trascina gli handle", QColor(80, 180, 255))
+
         # Crop / GrabCut overlay (coordinate SCENA)
         if self._mode == CanvasMode.CROP and self._crop_rect is not None:
             self._draw_crop_overlay(painter, scene_rect)
@@ -990,7 +1136,7 @@ class ImageCanvas(QGraphicsView):
         painter.resetTransform()   # coordinate schermo
 
         if self._text_anchor is None:
-            # Mostra solo cursore a croce dove si trova il mouse
+            # Cursore a croce finché non si clicca sul canvas
             if self._cursor_pos is not None:
                 painter.setPen(QPen(QColor(160, 120, 255, 160), 1.5))
                 sz = 10
@@ -1000,55 +1146,163 @@ class ImageCanvas(QGraphicsView):
             painter.restore()
             return
 
-        # Converti ancora da scene → viewport (mapFromScene è affidabile)
         anchor_vp = self.mapFromScene(self._text_anchor)
-        ax, ay = anchor_vp.x(), anchor_vp.y()
+        ax, ay = float(anchor_vp.x()), float(anchor_vp.y())
 
-        tp = self._text_preview
-        text = tp.get("text", "")
-        font_family = tp.get("font_family", "Arial")
-        font_size = tp.get("font_size", 24)
-        bold = tp.get("bold", False)
-        italic = tp.get("italic", False)
-        color: QColor = tp.get("color", QColor(0, 0, 0, 255))
+        tp         = self._text_preview
+        text       = tp.get("text", "")
+        font_family= tp.get("font_family", "Arial")
+        font_size  = tp.get("font_size", 24)
+        bold       = tp.get("bold",   False)
+        italic     = tp.get("italic", False)
+        color      = tp.get("color",  QColor(0, 0, 0, 255))
+        opacity    = tp.get("opacity", 1.0)
+        effect     = tp.get("effect", "none")
+        ec         = tp.get("effect_color", QColor(0, 0, 0, 200))
+        outline_w  = tp.get("outline_width", 2)
 
-        font = QFont(font_family)
-        font.setPixelSize(max(4, int(font_size * self._zoom_factor)))
-        font.setBold(bold)
-        font.setItalic(italic)
-        painter.setFont(font)
+        # Font scalato con lo zoom corrente
+        preview_size = max(4, int(font_size * self._zoom_factor))
 
         if text:
-            fm = painter.fontMetrics()
-            tw = fm.horizontalAdvance(text)
-            th = fm.height()
-            margin = 2
+            # Genera la patch con render_text_patch (stesso motore del render finale)
+            ec_rgba = (ec.red(), ec.green(), ec.blue(), ec.alpha())
+            c_rgba  = (color.red(), color.green(), color.blue(), color.alpha())
+            try:
+                patch_arr, anchor_x, anchor_y = render_text_patch(
+                    text=text,
+                    font_family=font_family,
+                    font_size=preview_size,
+                    bold=bold, italic=italic,
+                    color_rgba=c_rgba,
+                    opacity=opacity,
+                    effect=effect,
+                    effect_color=ec_rgba,
+                    outline_width=outline_w,
+                )
+                ph, pw = patch_arr.shape[:2]
+                # Converti numpy RGBA → QImage e disegna
+                qi = QImage(patch_arr.tobytes(), pw, ph,
+                            pw * 4, QImage.Format.Format_RGBA8888)
+                painter.drawImage(
+                    QPointF(ax - anchor_x, ay - anchor_y), qi)
 
-            # Disegna il testo con baseline a ay + ascent
-            # così il top del glifo è a ay, coerente con Pillow (x,y) = top-left
-            painter.setPen(QPen(color))
-            painter.drawText(QPointF(ax, ay + fm.ascent()), text)
+                # Rettangolo tratteggiato di selezione
+                m = 2
+                rect = QRectF(ax - anchor_x - m, ay - anchor_y - m,
+                              pw + m * 2, ph + m * 2)
+            except Exception:
+                # Fallback minimale in caso di errore
+                rect = QRectF(ax - 2, ay - 2, 100, font_size + 4)
 
-            # Rettangolo tratteggiato allineato al top-left (ax, ay)
-            rect = QRectF(ax - margin, ay - margin,
-                          tw + margin * 2, th + margin * 2)
             pen = QPen(QColor(160, 120, 255, 200), 1.5)
             pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(rect)
         else:
-            # Placeholder tratteggiato
+            # Placeholder
             painter.setPen(QPen(QColor(160, 120, 255, 120), 1.5, Qt.PenStyle.DashLine))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(QRectF(ax - 4, ay - 20, 120, 30))
             painter.setPen(QColor(160, 120, 255, 100))
+            f = QFont(); f.setPixelSize(11)
+            painter.setFont(f)
             painter.drawText(QPointF(ax, ay), "Inserisci testo nel pannello →")
 
         # Maniglietta di ancoraggio
         painter.setPen(QPen(QColor(160, 120, 255, 220), 1.5))
         painter.setBrush(QBrush(QColor(255, 255, 255, 200)))
         painter.drawEllipse(QPointF(ax, ay), 5, 5)
+        painter.restore()
+
+    def _draw_shape_overlay(self, painter: QPainter) -> None:
+        """Renderizza la forma corrente come overlay vettoriale sul canvas."""
+
+        # ── Ghost pre-click: anteprima semitrasparente dove si trova il cursore ──
+        if self._shape_current is None:
+            pos = self._shape_preview_pos
+            if pos is not None and self._shape_ghost_kind is not None:
+                from core.shapes import default_shape, ShapeStyle
+                ghost = default_shape(self._shape_ghost_kind, pos.x(), pos.y())
+                # Scala il ghost in base allo zoom: dimensione fissa a ~60px viewport
+                ghost_r = 50.0 / max(self._zoom_factor, 0.1)
+                ghost.rx = min(ghost_r, 80.0); ghost.ry = min(ghost_r * 0.75, 60.0)
+                ghost.style = ShapeStyle(
+                    fill_color=(100, 160, 255, 60),
+                    stroke_color=(80, 150, 255, 180),
+                    stroke_width=max(1, int(2 / self._zoom_factor)),
+                    opacity=1.0,
+                )
+                painter.save()
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                ghost._paint_on(painter)
+                # Crosshair centrale
+                cr = 8.0 / max(self._zoom_factor, 0.1)
+                painter.setPen(QPen(QColor(80, 150, 255, 200),
+                                    1.5 / max(self._zoom_factor, 0.1)))
+                painter.drawLine(QPointF(pos.x() - cr, pos.y()),
+                                 QPointF(pos.x() + cr, pos.y()))
+                painter.drawLine(QPointF(pos.x(), pos.y() - cr),
+                                 QPointF(pos.x(), pos.y() + cr))
+                painter.restore()
+            return
+
+        # ── Forma posizionata: disegna con handles ────────────────────
+        shape = self._shape_current
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # La forma è in coordinate scena (= coordinate immagine).
+        # Il painter di drawForeground è già in coordinate scena con zoom applicato.
+        shape._paint_on(painter)
+
+        # Handle
+        active_hid = (self._shape_drag_handle.id
+                      if self._shape_drag_handle else None)
+        HANDLE_R = max(4.0, min(7.0 / max(self._zoom_factor, 0.1), 16.0))
+
+        for h in shape.handles():
+            if not h.visible:
+                continue
+            is_active = (h.id == active_hid)
+            is_rotate = (h.id == HandleID.ROTATE)
+
+            if is_rotate:
+                # Linea tratteggiata dal centro all'handle di rotazione
+                painter.setPen(QPen(QColor(80, 180, 255, 160),
+                                    1.0 / max(self._zoom_factor, 0.1),
+                                    Qt.PenStyle.DashLine))
+                painter.drawLine(QPointF(shape.cx, shape.cy), h.pos)
+
+            fill_c   = QColor(80, 180, 255, 240) if is_active else QColor(255, 255, 255, 240)
+            border_c = QColor(40, 100, 200, 220)
+            painter.setPen(QPen(border_c, 1.5 / max(self._zoom_factor, 0.1)))
+            painter.setBrush(QBrush(fill_c))
+            r = HANDLE_R * (1.25 if is_active else 1.0)
+
+            if is_rotate:
+                # Diamante
+                path_d = QPainterPath()
+                path_d.moveTo(h.pos.x(),     h.pos.y() - r)
+                path_d.lineTo(h.pos.x() + r, h.pos.y())
+                path_d.lineTo(h.pos.x(),     h.pos.y() + r)
+                path_d.lineTo(h.pos.x() - r, h.pos.y())
+                path_d.closeSubpath()
+                painter.drawPath(path_d)
+            else:
+                painter.drawEllipse(h.pos, r, r)
+
+        # Bounding box tratteggiato (solo quando non si trascina)
+        if self._shape_drag_handle is None:
+            bb = shape.painter_path().boundingRect()
+            pen_bb = QPen(QColor(80, 180, 255, 120),
+                          1.0 / max(self._zoom_factor, 0.1),
+                          Qt.PenStyle.DashLine)
+            painter.setPen(pen_bb)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(bb)
+
         painter.restore()
 
     def _draw_badge(self, painter: QPainter, text: str, color: QColor) -> None:

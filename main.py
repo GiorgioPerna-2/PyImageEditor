@@ -9,7 +9,7 @@ from ui.main_window import MainWindow
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("PyImageEditor")
-    app.setApplicationVersion("0.11.1")
+    app.setApplicationVersion("0.12.0")
     app.setOrganizationName("ImageSuite")
 
     # Stile moderno nativo della piattaforma

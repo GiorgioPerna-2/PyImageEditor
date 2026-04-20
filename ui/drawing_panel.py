@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QSlider, QLabel, QColorDialog,
     QGroupBox, QFrame, QButtonGroup, QLineEdit,
-    QFontComboBox, QSpinBox, QCheckBox, QScrollArea, QComboBox,
+    QFontComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QScrollArea, QComboBox,
+    QPlainTextEdit, QFileDialog,
 )
 
 TOOLS = [
@@ -27,6 +28,7 @@ TOOLS = [
     ("gradient",       "🌈",    "Gradiente [G]"),
     ("heal",           "🩹",    "Guarigione [H]"),
     ("magic_wand",     "🪄",    "Bacchetta magica [W]"),
+    ("shape",          "⬟",    "Forme vettoriali [F]"),
 ]
 
 
@@ -86,6 +88,10 @@ class DrawingPanel(QWidget):
     sel_invert_requested = pyqtSignal()
     sel_deselect_requested = pyqtSignal()
     sel_feather_changed = pyqtSignal(int)   # raggio feather
+    # Forme
+    shape_changed       = pyqtSignal()
+    shape_apply         = pyqtSignal()
+    shape_kind_changed  = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -162,11 +168,12 @@ class DrawingPanel(QWidget):
         self._text_box = QGroupBox("Testo")
         text_layout = QVBoxLayout(self._text_box)
 
-        # Contenuto
-        self._txt_input = QLineEdit()
-        self._txt_input.setPlaceholderText("Scrivi qui il testo…")
-        self._txt_input.textChanged.connect(self._on_text_params_changed)
+        # Contenuto — QPlainTextEdit per supportare il tasto Invio / a capo
         text_layout.addWidget(QLabel("Contenuto:"))
+        self._txt_input = QPlainTextEdit()
+        self._txt_input.setPlaceholderText("Scrivi qui il testo…\n(Invio = a capo)")
+        self._txt_input.setFixedHeight(72)
+        self._txt_input.textChanged.connect(self._on_text_params_changed)
         text_layout.addWidget(self._txt_input)
 
         # Font family
@@ -176,7 +183,7 @@ class DrawingPanel(QWidget):
         text_layout.addWidget(QLabel("Font:"))
         text_layout.addWidget(self._font_combo)
 
-        # Size + Bold + Italic
+        # Dimensione + Bold + Italic
         style_row = QHBoxLayout()
         style_row.addWidget(QLabel("Dim:"))
         self._font_size = QSpinBox()
@@ -185,7 +192,6 @@ class DrawingPanel(QWidget):
         self._font_size.setSuffix(" px")
         self._font_size.valueChanged.connect(self._on_text_params_changed)
         style_row.addWidget(self._font_size)
-
         self._chk_bold   = QCheckBox("G")
         self._chk_italic = QCheckBox("I")
         self._chk_bold.setFont(QFont("Arial", 9, QFont.Weight.Bold))
@@ -197,9 +203,65 @@ class DrawingPanel(QWidget):
         style_row.addStretch()
         text_layout.addLayout(style_row)
 
+        # Opacità testo
+        op_row = QHBoxLayout()
+        op_row.addWidget(QLabel("Opacità:"))
+        self._txt_opacity = QSlider(Qt.Orientation.Horizontal)
+        self._txt_opacity.setRange(0, 100)
+        self._txt_opacity.setValue(100)
+        self._lbl_txt_opacity = QLabel("100%")
+        self._lbl_txt_opacity.setFixedWidth(36)
+        self._txt_opacity.valueChanged.connect(
+            lambda v: (self._lbl_txt_opacity.setText(f"{v}%"),
+                       self._on_text_params_changed()))
+        op_row.addWidget(self._txt_opacity, 1)
+        op_row.addWidget(self._lbl_txt_opacity)
+        text_layout.addLayout(op_row)
+
+        # Effetto WordArt
+        text_layout.addWidget(QLabel("Effetto:"))
+        self._txt_effect = QComboBox()
+        self._txt_effect.addItems([
+            "Nessuno",
+            "Ombra",
+            "Bordo",
+            "Gradiente",
+            "Arco",
+            "Onda",
+        ])
+        self._txt_effect.currentIndexChanged.connect(self._on_text_effect_changed)
+        text_layout.addWidget(self._txt_effect)
+
+        # Colore secondario (ombra / bordo / gradiente)
+        self._effect_color_row = QHBoxLayout()
+        self._lbl_effect_color = QLabel("Colore effetto:")
+        self._btn_effect_color = QPushButton()
+        self._btn_effect_color.setFixedSize(32, 22)
+        self._effect_color_val = QColor(0, 0, 0, 200)
+        self._btn_effect_color.setStyleSheet(
+            f"background:{self._effect_color_val.name()}; border:1px solid #666;")
+        self._btn_effect_color.clicked.connect(self._pick_effect_color)
+        self._effect_color_row.addWidget(self._lbl_effect_color)
+        self._effect_color_row.addWidget(self._btn_effect_color)
+        self._effect_color_row.addStretch()
+        text_layout.addLayout(self._effect_color_row)
+
+        # Spessore bordo (visibile solo con effetto "Bordo")
+        self._outline_row = QHBoxLayout()
+        self._outline_row.addWidget(QLabel("Spessore bordo:"))
+        self._txt_outline_w = QSpinBox()
+        self._txt_outline_w.setRange(1, 30)
+        self._txt_outline_w.setValue(2)
+        self._txt_outline_w.valueChanged.connect(self._on_text_params_changed)
+        self._outline_row.addWidget(self._txt_outline_w)
+        self._outline_row.addStretch()
+        text_layout.addLayout(self._outline_row)
+
+        self._on_text_effect_changed(0)   # inizia con "Nessuno"
+
         # Istruzioni
-        hint = QLabel("<i>Clicca sul canvas per posizionare il testo.<br>"
-                      "Trascina per spostarlo.</i>")
+        hint = QLabel("<i>Clicca sul canvas per posizionare.<br>"
+                      "Trascina per spostare.</i>")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888; font-size: 10px;")
         text_layout.addWidget(hint)
@@ -315,6 +377,175 @@ class DrawingPanel(QWidget):
         self._wand_box.setVisible(False)
         root.addWidget(self._wand_box)
 
+        # ── Sezione Forme (visibile solo con tool "shape") ─────────────
+        self._shape_box = QGroupBox("Forme vettoriali")
+        sh = QVBoxLayout(self._shape_box)
+
+        sh.addWidget(QLabel("Tipo:"))
+        self._shape_kind_combo = QComboBox()
+        _SHAPE_KINDS = [
+            ("Ellisse / Cerchio",  "ellipse"),
+            ("Rettangolo",         "rect"),
+            ("Poligono regolare",  "polygon"),
+            ("Stella",             "star"),
+            ("Squircle",           "squircle"),
+            ("Freccia",            "arrow"),
+            ("Logo SVG",           "svg"),
+        ]
+        for label, key in _SHAPE_KINDS:
+            self._shape_kind_combo.addItem(label, key)
+        self._shape_kind_combo.currentIndexChanged.connect(self._on_shape_kind_idx_changed)
+        sh.addWidget(self._shape_kind_combo)
+
+        # Colore riempimento
+        fill_row = QHBoxLayout()
+        fill_row.addWidget(QLabel("Riempimento:"))
+        self._shape_fill_btn = QPushButton()
+        self._shape_fill_btn.setFixedSize(36, 22)
+        self._shape_fill_color = QColor(100, 149, 237, 200)
+        self._shape_fill_btn.setStyleSheet(
+            f"background:rgba(100,149,237,200); border:1px solid #666; border-radius:3px;")
+        self._shape_fill_btn.clicked.connect(self._pick_shape_fill)
+        self._shape_chk_fill = QCheckBox("Vis.")
+        self._shape_chk_fill.setChecked(True)
+        self._shape_chk_fill.toggled.connect(self._emit_shape_changed)
+        fill_row.addWidget(self._shape_fill_btn)
+        fill_row.addWidget(self._shape_chk_fill)
+        fill_row.addStretch()
+        sh.addLayout(fill_row)
+
+        # Colore bordo + spessore
+        stroke_row = QHBoxLayout()
+        stroke_row.addWidget(QLabel("Bordo:"))
+        self._shape_stroke_btn = QPushButton()
+        self._shape_stroke_btn.setFixedSize(36, 22)
+        self._shape_stroke_color = QColor(30, 30, 30, 255)
+        self._shape_stroke_btn.setStyleSheet(
+            "background:rgba(30,30,30,255); border:1px solid #666; border-radius:3px;")
+        self._shape_stroke_btn.clicked.connect(self._pick_shape_stroke)
+        self._shape_stroke_w = QSpinBox()
+        self._shape_stroke_w.setRange(0, 60)
+        self._shape_stroke_w.setValue(2)
+        self._shape_stroke_w.setSuffix(" px")
+        self._shape_stroke_w.setFixedWidth(68)
+        self._shape_stroke_w.valueChanged.connect(self._emit_shape_changed)
+        stroke_row.addWidget(self._shape_stroke_btn)
+        stroke_row.addWidget(self._shape_stroke_w)
+        stroke_row.addStretch()
+        sh.addLayout(stroke_row)
+
+        # Opacità
+        op_sh_row = QHBoxLayout()
+        op_sh_row.addWidget(QLabel("Opacità:"))
+        self._shape_opacity_sl = QSlider(Qt.Orientation.Horizontal)
+        self._shape_opacity_sl.setRange(0, 100)
+        self._shape_opacity_sl.setValue(100)
+        self._lbl_shape_op = QLabel("100%")
+        self._lbl_shape_op.setFixedWidth(36)
+        self._shape_opacity_sl.valueChanged.connect(
+            lambda v: (self._lbl_shape_op.setText(f"{v}%"), self._emit_shape_changed()))
+        op_sh_row.addWidget(self._shape_opacity_sl, 1)
+        op_sh_row.addWidget(self._lbl_shape_op)
+        sh.addLayout(op_sh_row)
+
+        # Parametri specifici (visibili condizionalmente)
+        # Angoli arrotondati (rect)
+        self._sh_corner_row = QHBoxLayout()
+        self._sh_corner_lbl = QLabel("Arrotondamento:")
+        self._sh_corner_r = QSpinBox()
+        self._sh_corner_r.setRange(0, 200); self._sh_corner_r.setValue(0)
+        self._sh_corner_r.setSuffix(" px")
+        self._sh_corner_r.valueChanged.connect(self._emit_shape_changed)
+        self._sh_corner_row.addWidget(self._sh_corner_lbl)
+        self._sh_corner_row.addWidget(self._sh_corner_r)
+        self._sh_corner_row.addStretch()
+        sh.addLayout(self._sh_corner_row)
+
+        # Lati / punte (polygon, star)
+        self._sh_sides_row = QHBoxLayout()
+        self._sh_sides_lbl = QLabel("Lati / punte:")
+        self._sh_n_sides = QSpinBox()
+        self._sh_n_sides.setRange(3, 20); self._sh_n_sides.setValue(6)
+        self._sh_n_sides.valueChanged.connect(self._emit_shape_changed)
+        self._sh_sides_row.addWidget(self._sh_sides_lbl)
+        self._sh_sides_row.addWidget(self._sh_n_sides)
+        self._sh_sides_row.addStretch()
+        sh.addLayout(self._sh_sides_row)
+
+        # Raggio interno (star)
+        self._sh_inner_row = QHBoxLayout()
+        self._sh_inner_lbl = QLabel("Raggio interno:")
+        self._sh_inner = QDoubleSpinBox()
+        self._sh_inner.setRange(0.05, 0.95); self._sh_inner.setSingleStep(0.05)
+        self._sh_inner.setValue(0.45)
+        self._sh_inner.valueChanged.connect(self._emit_shape_changed)
+        self._sh_inner_row.addWidget(self._sh_inner_lbl)
+        self._sh_inner_row.addWidget(self._sh_inner)
+        self._sh_inner_row.addStretch()
+        sh.addLayout(self._sh_inner_row)
+
+        # Esponente squircle
+        self._sh_exp_row = QHBoxLayout()
+        self._sh_exp_lbl = QLabel("Esponente:")
+        self._sh_exp = QDoubleSpinBox()
+        self._sh_exp.setRange(2.0, 20.0); self._sh_exp.setSingleStep(0.5)
+        self._sh_exp.setValue(4.0)
+        self._sh_exp.valueChanged.connect(self._emit_shape_changed)
+        self._sh_exp_row.addWidget(self._sh_exp_lbl)
+        self._sh_exp_row.addWidget(self._sh_exp)
+        self._sh_exp_row.addStretch()
+        sh.addLayout(self._sh_exp_row)
+
+        # Freccia: larghezza gambo
+        self._sh_aw_row = QHBoxLayout()
+        self._sh_aw_lbl = QLabel("Largh. gambo:")
+        self._sh_arrow_w = QSpinBox()
+        self._sh_arrow_w.setRange(4, 200); self._sh_arrow_w.setValue(22)
+        self._sh_arrow_w.setSuffix(" px")
+        self._sh_arrow_w.valueChanged.connect(self._emit_shape_changed)
+        self._sh_aw_row.addWidget(self._sh_aw_lbl)
+        self._sh_aw_row.addWidget(self._sh_arrow_w)
+        self._sh_aw_row.addStretch()
+        sh.addLayout(self._sh_aw_row)
+
+        # SVG: pulsante carica + tint
+        self._sh_svg_row = QHBoxLayout()
+        self._sh_btn_svg = QPushButton("📂 Carica SVG…")
+        self._sh_btn_svg.clicked.connect(self._load_svg)
+        self._sh_lbl_svg = QLabel("Nessun file")
+        self._sh_lbl_svg.setStyleSheet("color:#888; font-size:10px;")
+        self._sh_svg_row.addWidget(self._sh_btn_svg)
+        sh.addLayout(self._sh_svg_row)
+        sh.addWidget(self._sh_lbl_svg)
+
+        self._sh_tint_row = QHBoxLayout()
+        self._sh_chk_tint = QCheckBox("Tinta colore riempimento")
+        self._sh_chk_tint.setChecked(False)
+        self._sh_chk_tint.setToolTip(
+            "Se attivo, sovrappone il colore di riempimento all'SVG.\n"
+            "Utile per SVG monocromatici (loghi, icone).\n"
+            "Disattiva per SVG multicolore.")
+        self._sh_chk_tint.toggled.connect(self._emit_shape_changed)
+        self._sh_tint_row.addWidget(self._sh_chk_tint)
+        sh.addLayout(self._sh_tint_row)
+
+        # Hint
+        sh_hint = QLabel("<i>Clicca sul canvas per inserire.<br>"
+                         "Trascina gli handle per modificare.</i>")
+        sh_hint.setWordWrap(True)
+        sh_hint.setStyleSheet("color:#888; font-size:10px;")
+        sh.addWidget(sh_hint)
+
+        # Applica
+        sh_apply = QPushButton("✓ Applica forma sul layer")
+        sh_apply.setStyleSheet("font-weight:bold; padding:5px;")
+        sh_apply.clicked.connect(self.shape_apply)
+        sh.addWidget(sh_apply)
+
+        self._shape_box.setVisible(False)
+        root.addWidget(self._shape_box)
+        self._on_shape_kind_idx_changed(0)   # init visibilità parametri
+
         root.addStretch()
 
     # ── Public API ────────────────────────────────────────────────────
@@ -362,7 +593,7 @@ class DrawingPanel(QWidget):
         return self._wand_antialias.isChecked() if hasattr(self, "_wand_antialias") else True
 
     @property
-    def text_content(self) -> str: return self._txt_input.text()
+    def text_content(self) -> str: return self._txt_input.toPlainText()
     @property
     def font_family(self) -> str:  return self._font_combo.currentFont().family()
     @property
@@ -371,6 +602,91 @@ class DrawingPanel(QWidget):
     def font_bold(self) -> bool:   return self._chk_bold.isChecked()
     @property
     def font_italic(self) -> bool: return self._chk_italic.isChecked()
+    @property
+    def text_opacity(self) -> float:
+        return self._txt_opacity.value() / 100.0
+    @property
+    def text_effect(self) -> str:
+        _map = {0: "none", 1: "shadow", 2: "outline", 3: "gradient",
+                4: "arch", 5: "wave"}
+        return _map.get(self._txt_effect.currentIndex(), "none")
+    @property
+    def text_effect_color(self) -> tuple:
+        c = self._effect_color_val
+        return (c.red(), c.green(), c.blue(), c.alpha())
+    @property
+    def text_outline_width(self) -> int:
+        return self._txt_outline_w.value()
+
+    # ── Shape properties ──────────────────────────────────────────────
+
+    @property
+    def shape_kind_key(self) -> str:
+        return self._shape_kind_combo.currentData() or "ellipse"
+
+    @property
+    def shape_fill_color(self) -> tuple:
+        c = self._shape_fill_color
+        a = c.alpha() if self._shape_chk_fill.isChecked() else 0
+        return (c.red(), c.green(), c.blue(), a)
+
+    @property
+    def shape_stroke_color(self) -> tuple:
+        c = self._shape_stroke_color
+        return (c.red(), c.green(), c.blue(), c.alpha())
+
+    @property
+    def shape_stroke_width(self) -> int:
+        return self._shape_stroke_w.value()
+
+    @property
+    def shape_opacity(self) -> float:
+        return self._shape_opacity_sl.value() / 100.0
+
+    @property
+    def shape_n_sides(self) -> int:
+        return self._sh_n_sides.value()
+
+    @property
+    def shape_inner_ratio(self) -> float:
+        return self._sh_inner.value()
+
+    @property
+    def shape_sq_exp(self) -> float:
+        return self._sh_exp.value()
+
+    @property
+    def shape_corner_r(self) -> float:
+        return float(self._sh_corner_r.value())
+
+    @property
+    def shape_arrow_width(self) -> float:
+        return float(self._sh_arrow_w.value())
+
+    @property
+    def shape_svg_tint(self) -> bool:
+        return self._sh_chk_tint.isChecked()
+
+    def get_svg_path(self) -> str:
+        return getattr(self, '_svg_path_val', '')
+
+    def set_svg_filename(self, name: str) -> None:
+        self._sh_lbl_svg.setText(name)
+
+    def sync_shape_from(self, shape) -> None:
+        """Aggiorna i widget leggendo i valori dalla shape (senza emettere segnali)."""
+        for widget in (self._sh_n_sides, self._sh_inner, self._sh_exp,
+                       self._sh_corner_r, self._sh_arrow_w, self._shape_opacity_sl):
+            widget.blockSignals(True)
+        self._sh_n_sides.setValue(shape.n_sides)
+        self._sh_inner.setValue(shape.inner_ratio)
+        self._sh_exp.setValue(shape.sq_exp)
+        self._sh_corner_r.setValue(int(shape.corner_r))
+        self._sh_arrow_w.setValue(int(shape.arrow_width))
+        self._shape_opacity_sl.setValue(int(shape.style.opacity * 100))
+        for widget in (self._sh_n_sides, self._sh_inner, self._sh_exp,
+                       self._sh_corner_r, self._sh_arrow_w, self._shape_opacity_sl):
+            widget.blockSignals(False)
 
     def select_tool(self, key: str) -> None:
         if key in self._btns:
@@ -392,6 +708,30 @@ class DrawingPanel(QWidget):
     def _on_text_params_changed(self, *_) -> None:
         self.text_params_changed.emit()
 
+    def _on_text_effect_changed(self, idx: int) -> None:
+        # Mostra/nascondi i controlli secondari in base all'effetto scelto
+        has_color   = idx in (1, 2, 3)   # ombra, bordo, gradiente
+        has_outline = idx == 2            # solo bordo
+        self._lbl_effect_color.setVisible(has_color)
+        self._btn_effect_color.setVisible(has_color)
+        self._txt_outline_w.setVisible(has_outline)
+        # il label "Spessore bordo" è il primo widget del _outline_row
+        for i in range(self._outline_row.count()):
+            w = self._outline_row.itemAt(i).widget()
+            if w:
+                w.setVisible(has_outline)
+        self._on_text_params_changed()
+
+    def _pick_effect_color(self) -> None:
+        c = QColorDialog.getColor(
+            self._effect_color_val, self, "Colore effetto",
+            QColorDialog.ColorDialogOption.ShowAlphaChannel)
+        if c.isValid():
+            self._effect_color_val = c
+            self._btn_effect_color.setStyleSheet(
+                f"background:{c.name()}; border:1px solid #666;")
+            self._on_text_params_changed()
+
     # ── Helpers ───────────────────────────────────────────────────────
 
     def _activate(self, key: str | None) -> None:
@@ -407,6 +747,7 @@ class DrawingPanel(QWidget):
         is_select = self._active_tool in ("select_rect", "select_ellipse", "select_lasso")
         is_grad   = self._active_tool == "gradient"
         is_wand   = self._active_tool == "magic_wand"
+        is_shape  = self._active_tool == "shape"
 
         self._size_box.setVisible(is_draw or is_clone)
         self._hard_box.setVisible(is_draw or is_clone)
@@ -420,6 +761,8 @@ class DrawingPanel(QWidget):
             self._grad_box.setVisible(is_grad)
         if hasattr(self, "_wand_box"):
             self._wand_box.setVisible(is_wand)
+        if hasattr(self, "_shape_box"):
+            self._shape_box.setVisible(is_shape)
 
         if self._active_tool == "smudge":
             self._hard_box.setTitle("Intensità sfumino")
@@ -431,6 +774,67 @@ class DrawingPanel(QWidget):
             self._hard_box.setTitle("Durezza")
 
         self.tool_changed.emit(self._active_tool)
+
+    def _emit_shape_changed(self, *_) -> None:
+        self.shape_changed.emit()
+
+    def _on_shape_kind_idx_changed(self, idx: int) -> None:
+        key = self._shape_kind_combo.itemData(idx) or "ellipse"
+        is_rect  = key == "rect"
+        is_poly  = key == "polygon"
+        is_star  = key == "star"
+        is_sq    = key == "squircle"
+        is_arrow = key == "arrow"
+        is_svg   = key == "svg"
+        is_ps    = is_poly or is_star
+
+        def _sv(layout, visible):
+            for i in range(layout.count()):
+                w = layout.itemAt(i).widget()
+                if w:
+                    w.setVisible(visible)
+
+        _sv(self._sh_corner_row, is_rect)
+        _sv(self._sh_sides_row,  is_ps)
+        _sv(self._sh_inner_row,  is_star)
+        _sv(self._sh_exp_row,    is_sq)
+        _sv(self._sh_aw_row,     is_arrow)
+        self._sh_btn_svg.setVisible(is_svg)
+        self._sh_lbl_svg.setVisible(is_svg)
+        _sv(self._sh_tint_row, is_svg)
+
+        self.shape_kind_changed.emit(key)
+        self._emit_shape_changed()
+
+    def _pick_shape_fill(self) -> None:
+        c = QColorDialog.getColor(self._shape_fill_color, self, "Colore riempimento",
+                                   QColorDialog.ColorDialogOption.ShowAlphaChannel)
+        if c.isValid():
+            self._shape_fill_color = c
+            self._shape_fill_btn.setStyleSheet(
+                f"background:rgba({c.red()},{c.green()},{c.blue()},{c.alpha()});"
+                "border:1px solid #666; border-radius:3px;")
+            self._emit_shape_changed()
+
+    def _pick_shape_stroke(self) -> None:
+        c = QColorDialog.getColor(self._shape_stroke_color, self, "Colore bordo",
+                                   QColorDialog.ColorDialogOption.ShowAlphaChannel)
+        if c.isValid():
+            self._shape_stroke_color = c
+            self._shape_stroke_btn.setStyleSheet(
+                f"background:rgba({c.red()},{c.green()},{c.blue()},{c.alpha()});"
+                "border:1px solid #666; border-radius:3px;")
+            self._emit_shape_changed()
+
+    def _load_svg(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Carica logo SVG", "",
+            "File SVG (*.svg *.svgz);;Tutti i file (*)")
+        if path:
+            self._svg_path_val = path
+            from pathlib import Path
+            self._sh_lbl_svg.setText(Path(path).name)
+            self._emit_shape_changed()
 
     def _update_rgba_label(self, c: QColor) -> None:
         self._lbl_rgba.setText(f"R:{c.red()} G:{c.green()} B:{c.blue()} A:{c.alpha()}")

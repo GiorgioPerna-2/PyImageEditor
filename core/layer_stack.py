@@ -337,6 +337,80 @@ class LayerStack:
                 dst, region, layer.opacity, layer.blend_mode)
         return np.clip(result, 0, 255).astype(np.uint8)
 
+    def fast_composite_patch(
+        self,
+        bg_cache:   np.ndarray,
+        canvas_img: np.ndarray,
+        dirty_cx0:  int,
+        dirty_cy0:  int,
+        dirty_cx1:  int,
+        dirty_cy1:  int,
+    ) -> tuple[int, int, int, int]:
+        """
+        Aggiorna SOLO il patch sporco (dirty rect in coordinate canvas) di
+        canvas_img sovrapponendo il layer attivo su bg_cache.
+
+        Non copia mai l'intero bg_cache — opera solo sulla regione dirty,
+        riducendo il lavoro da O(W×H) a O(brush_size²).
+
+        Parameters
+        ----------
+        bg_cache    : float32 (canvas_H, canvas_W, 4) — sfondo pre-calcolato
+        canvas_img  : uint8  (canvas_H, canvas_W, 4) — output aggiornato in-place
+        dirty_cx0/1, dirty_cy0/1 : dirty rect già clippata ai bordi del canvas
+
+        Returns
+        -------
+        (dirty_cx0, dirty_cy0, dirty_cx1, dirty_cy1)
+        """
+        layer = self.active
+        canvas_h, canvas_w = bg_cache.shape[:2]
+        ox, oy = layer.offset_x, layer.offset_y
+        lh, lw = layer.data.shape[:2]
+
+        # Intersezione dirty rect ∩ area del layer nel canvas
+        lcx0 = max(0, ox);        lcy0 = max(0, oy)
+        lcx1 = min(canvas_w, ox + lw);  lcy1 = min(canvas_h, oy + lh)
+
+        ix0 = max(dirty_cx0, lcx0);  iy0 = max(dirty_cy0, lcy0)
+        ix1 = min(dirty_cx1, lcx1);  iy1 = min(dirty_cy1, lcy1)
+
+        if ix0 >= ix1 or iy0 >= iy1:
+            # La dirty rect non si sovrappone al layer: copia solo il bg
+            _blit_bg(bg_cache, canvas_img, dirty_cy0, dirty_cy1, dirty_cx0, dirty_cx1)
+            return (dirty_cx0, dirty_cy0, dirty_cx1, dirty_cy1)
+
+        # Coordinate layer locali
+        llx0 = ix0 - ox;  lly0 = iy0 - oy
+        llx1 = ix1 - ox;  lly1 = iy1 - oy
+
+        bg_patch    = bg_cache[iy0:iy1, ix0:ix1]          # float32 view — no copy
+        layer_patch = layer.data[lly0:lly1, llx0:llx1].astype(np.float32)
+
+        if layer.mask is not None:
+            mh, mw = layer.mask.shape
+            mx0 = min(llx0, mw); my0 = min(lly0, mh)
+            mx1 = min(llx1, mw); my1 = min(lly1, mh)
+            if mx1 > mx0 and my1 > my0:
+                mask_r = layer.mask[my0:my1, mx0:mx1].astype(np.float32) / 255.0
+                ph = min(layer_patch.shape[0], mask_r.shape[0])
+                pw = min(layer_patch.shape[1], mask_r.shape[1])
+                layer_patch = layer_patch[:ph, :pw].copy()
+                layer_patch[:, :, 3] *= mask_r[:ph, :pw]
+                ix1 = ix0 + pw;  iy1 = iy0 + ph
+                bg_patch = bg_cache[iy0:iy1, ix0:ix1]
+
+        composited = _composite_over(bg_patch, layer_patch, layer.opacity, layer.blend_mode)
+        canvas_img[iy0:iy1, ix0:ix1] = np.clip(composited, 0, 255).astype(np.uint8)
+
+        # Aree della dirty rect fuori dal layer → copia solo bg
+        for ry0, ry1, rx0, rx1 in _dirty_complement(
+                dirty_cy0, dirty_cy1, dirty_cx0, dirty_cx1,
+                iy0, iy1, ix0, ix1):
+            _blit_bg(bg_cache, canvas_img, ry0, ry1, rx0, rx1)
+
+        return (dirty_cx0, dirty_cy0, dirty_cx1, dirty_cy1)
+
     def _composite_nodes(self, nodes: list[NodeType], canvas_w: int, canvas_h: int,
                          override_path: Path | None = None,
                          override_data: np.ndarray | None = None,
@@ -473,6 +547,38 @@ def _blend_rgb(src: np.ndarray, dst: np.ndarray, mode: str) -> np.ndarray:
     elif mode == "lighten":    b = np.maximum(s, d)
     else:                      b = s
     return b * 255.0
+
+
+def _dirty_complement(
+    dy0: int, dy1: int, dx0: int, dx1: int,   # outer dirty rect
+    iy0: int, iy1: int, ix0: int, ix1: int,   # inner (layer) rect
+) -> list[tuple[int, int, int, int]]:
+    """
+    Restituisce le sotto-regioni della dirty rect che NON si sovrappongono
+    con la regione del layer, utili per copiarvi il solo background.
+    """
+    rects: list[tuple[int, int, int, int]] = []
+    if dy0 < iy0:
+        rects.append((dy0, min(iy0, dy1), dx0, dx1))
+    if iy1 < dy1:
+        rects.append((max(iy1, dy0), dy1, dx0, dx1))
+    mid_y0 = max(dy0, iy0); mid_y1 = min(dy1, iy1)
+    if mid_y0 < mid_y1:
+        if dx0 < ix0:
+            rects.append((mid_y0, mid_y1, dx0, min(ix0, dx1)))
+        if ix1 < dx1:
+            rects.append((mid_y0, mid_y1, max(ix1, dx0), dx1))
+    return rects
+
+
+def _blit_bg(
+    bg: np.ndarray, dst: np.ndarray,
+    y0: int, y1: int, x0: int, x1: int,
+) -> None:
+    """Copia bg[y0:y1, x0:x1] → dst (conversione float32→uint8 inclusa)."""
+    if y0 >= y1 or x0 >= x1:
+        return
+    dst[y0:y1, x0:x1] = np.clip(bg[y0:y1, x0:x1], 0, 255).astype(np.uint8)
 
 
 def _composite_over(dst: np.ndarray, src: np.ndarray,

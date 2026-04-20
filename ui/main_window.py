@@ -40,6 +40,8 @@ from ui.history_panel import HistoryPanel
 from ui.upscale_panel import UpscalePanel, _UpscaleWorker
 from core.magic_wand import magic_wand_select
 from core.raw_io import is_raw, load_raw, RAW_EXTENSIONS
+from core.shapes import (Shape, ShapeKind, ShapeStyle, HandleID,
+                          default_shape, render_shape_onto)
 
 
 class _RembgWorker(QObject):
@@ -113,6 +115,60 @@ class _MagicWandWorker(QObject):
             self.error.emit(str(exc))
 
 
+def _union_dirty(dirty_iter) -> tuple | None:
+    """Unisce più DirtyRect (lx0,ly0,lx1,ly1) in un unico bounding box."""
+    x0 = y0 = float('inf')
+    x1 = y1 = float('-inf')
+    found = False
+    for d in dirty_iter:
+        if not d or d == (0, 0, 0, 0):
+            continue
+        found = True
+        x0 = min(x0, d[0]); y0 = min(y0, d[1])
+        x1 = max(x1, d[2]); y1 = max(y1, d[3])
+    return (int(x0), int(y0), int(x1), int(y1)) if found else None
+
+
+_SHAPE_KEY_MAP: dict[str, ShapeKind] = {
+    "ellipse":  ShapeKind.ELLIPSE,
+    "rect":     ShapeKind.RECT,
+    "polygon":  ShapeKind.POLYGON,
+    "star":     ShapeKind.STAR,
+    "squircle": ShapeKind.SQUIRCLE,
+    "arrow":    ShapeKind.ARROW,
+    "svg":      ShapeKind.SVG,
+}
+
+
+def _shape_key_to_kind(key: str) -> ShapeKind:
+    return _SHAPE_KEY_MAP.get(key, ShapeKind.ELLIPSE)
+
+
+def _apply_panel_to_shape(dp, shape: Shape) -> None:
+    """
+    Copia tutti i parametri dalla DrawingPanel sulla shape.
+    Separato da MainWindow per leggibilità e testabilità.
+    """
+    from core.shapes import ShapeStyle
+    shape.style = ShapeStyle(
+        fill_color   = dp.shape_fill_color,
+        stroke_color = dp.shape_stroke_color,
+        stroke_width = dp.shape_stroke_width,
+        opacity      = dp.shape_opacity,
+    )
+    shape.n_sides      = dp.shape_n_sides
+    shape.inner_ratio  = dp.shape_inner_ratio
+    shape.sq_exp       = dp.shape_sq_exp
+    shape.corner_r     = dp.shape_corner_r
+    shape.arrow_width  = dp.shape_arrow_width
+    # SVG: percorso file e flag tint
+    if shape.kind == ShapeKind.SVG:
+        svg_path = dp.get_svg_path()
+        if svg_path:
+            shape.svg_path  = svg_path
+        shape.svg_tint  = dp.shape_svg_tint
+
+
 class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
@@ -145,11 +201,14 @@ class MainWindow(QMainWindow):
         self._clone_last_src: Optional[tuple[float,float]] = None
         self._clone_timer_id: int = 0
         self._draw_bg_cache: np.ndarray | None = None
+        self._canvas_img_buf: np.ndarray | None = None
         self._rembg_thread: QThread | None = None
         self._rembg_worker: _RembgWorker | None = None
         self._heal_mask_acc: np.ndarray | None = None   # maschera cumulativa del tratto heal
         self._wand_thread:  QThread | None = None
         self._wand_worker:  _MagicWandWorker | None = None
+        self._current_shape: Shape | None = None
+        self._svg_path:      str = ""
 
         self._canvas = ImageCanvas()
         self.setCentralWidget(self._canvas)
@@ -226,6 +285,13 @@ class MainWindow(QMainWindow):
         # Stato upscale thread
         self._upscale_thread: QThread | None = None
         self._upscale_worker: _UpscaleWorker | None = None
+
+        # ── Segnali Forme (da DrawingPanel) ──────────────────────────
+        self._drawing_panel.shape_changed.connect(self._on_shape_params_changed)
+        self._drawing_panel.shape_apply.connect(self._on_shape_apply)
+        self._drawing_panel.shape_kind_changed.connect(self._on_shape_kind_changed)
+        self._canvas.shape_placed.connect(self._on_shape_placed)
+        self._canvas.shape_handle_drag.connect(self._on_shape_handle_drag)
 
         # ── Segnali pannello disegno ──────────────────────────────────
         self._drawing_panel.tool_changed.connect(self._on_draw_tool_changed)
@@ -401,7 +467,7 @@ class MainWindow(QMainWindow):
         for key, shortcut in (("brush","B"), ("eraser","E"), ("smudge","U"),
                                ("eyedropper","I"), ("text","T"),
                                ("select_rect","S"), ("select_lasso","L"),
-                               ("clone","C")):
+                               ("clone","C"), ("shape","F")):
             a = self._action("", QKeySequence(shortcut),
                              lambda _, k=key: self._drawing_panel.select_tool(k))
             self.addAction(a)
@@ -827,6 +893,13 @@ class MainWindow(QMainWindow):
             self._canvas.end_clone_mode()
         if prev == "magic_wand" and tool != "magic_wand":
             self._cancel_wand_thread()
+        if prev == "shape" and tool != "shape":
+            self._current_shape = None
+            self._canvas.set_shape(None)
+            self._canvas.set_shape_ghost_kind(None)
+        if tool == "shape":
+            self._canvas.set_shape_ghost_kind(
+                _shape_key_to_kind(self._drawing_panel.shape_kind_key))
         if tool and self._canvas.mode == CanvasMode.MOVE:
             self._canvas.set_move_mode(False); self._act_move.setChecked(False)
 
@@ -852,6 +925,7 @@ class MainWindow(QMainWindow):
             "gradient":       "🌈 Gradiente",
             "heal":           "🩹 Guarigione",
             "magic_wand":     "🪄 Bacchetta magica",
+            "shape":          "⬟ Forme vettoriali",
         }
         self._lbl_mode.setText(label_map.get(tool, ""))
         self._update_actions()
@@ -867,37 +941,60 @@ class MainWindow(QMainWindow):
 
     def _on_stroke_begin(self, x: float, y: float) -> None:
         if self._layer_stack is None: return
-        # Pre-calcola background senza il layer attivo — usato per tutti gli update durante il tratto
-        self._draw_bg_cache = self._layer_stack.composite_without_active()
+        self._draw_bg_cache  = self._layer_stack.composite_without_active()
+        self._canvas_img_buf = self._layer_stack.fast_composite_active(self._draw_bg_cache)
+        self._canvas.update_image(self._canvas_img_buf)
         self._last_stroke_pt = (x, y)
         if self._drawing_panel.active_tool != "smudge":
-            self._apply_stamp(x, y)
+            dirty = self._apply_stamp(x, y)
+            if dirty and dirty != (0, 0, 0, 0):
+                self._flush_dirty(dirty)
 
     def _on_stroke_move(self, x: float, y: float) -> None:
         if self._layer_stack is None or self._last_stroke_pt is None: return
         tool = self._drawing_panel.active_tool
+
         if tool == "smudge":
             layer = self._layer_stack.active
-            lx1 = x - layer.offset_x; ly1 = y - layer.offset_y
-            apply_smudge(layer.data, int(lx1), int(ly1),
+            lx = int(x - layer.offset_x)
+            ly = int(y - layer.offset_y)
+            apply_smudge(layer.data, lx, ly,
                          self._drawing_panel.brush_size,
                          self._drawing_panel.hardness / 100.0)
+            r = self._drawing_panel.brush_size // 2 + 2
+            self._flush_dirty((lx - r, ly - r, lx + r, ly + r))
         else:
             pts = interpolate_stroke(self._last_stroke_pt, (x, y),
                                      self._drawing_panel.brush_size)
-            for px, py in pts:
-                self._apply_stamp(px, py)
+            union = _union_dirty(self._apply_stamp(px, py) for px, py in pts)
+            if union:
+                self._flush_dirty(union)
+
         self._last_stroke_pt = (x, y)
-        # Fast update: sovrapponi solo il layer attivo sul background pre-calcolato
-        if self._draw_bg_cache is not None:
-            self._canvas.update_image(
-                self._layer_stack.fast_composite_active(self._draw_bg_cache))
-        else:
-            self._canvas.update_image(self._layer_stack.composite())
+
+    def _flush_dirty(self, dirty_layer: tuple) -> None:
+        """Ricomposta solo il patch sporco e aggiorna solo quella regione del canvas."""
+        if self._draw_bg_cache is None or self._canvas_img_buf is None: return
+        layer = self._layer_stack.active
+        lx0, ly0, lx1, ly1 = dirty_layer
+        cx0 = int(lx0) + layer.offset_x
+        cy0 = int(ly0) + layer.offset_y
+        cx1 = int(lx1) + layer.offset_x
+        cy1 = int(ly1) + layer.offset_y
+        ch, cw = self._draw_bg_cache.shape[:2]
+        cx0 = max(0, cx0); cy0 = max(0, cy0)
+        cx1 = min(cw, cx1); cy1 = min(ch, cy1)
+        if cx0 >= cx1 or cy0 >= cy1: return
+        self._layer_stack.fast_composite_patch(
+            self._draw_bg_cache, self._canvas_img_buf,
+            cx0, cy0, cx1, cy1)
+        self._canvas.update_image_patch(
+            self._canvas_img_buf, cx0, cy0, cx1, cy1)
 
     def _on_stroke_end(self) -> None:
         self._last_stroke_pt = None
-        self._draw_bg_cache = None
+        self._draw_bg_cache  = None
+        self._canvas_img_buf = None
         if self._layer_stack is None: return
         composite = self._layer_stack.composite()
         self._canvas.update_image(composite)
@@ -905,17 +1002,19 @@ class MainWindow(QMainWindow):
         self._mark_changed(); self._update_actions()
         self._refresh_history_panel()
 
-    def _apply_stamp(self, x: float, y: float) -> None:
-        if self._layer_stack is None: return
+    def _apply_stamp(self, x: float, y: float) -> tuple:
+        """Applica un dab e restituisce la dirty rect in coordinate LAYER."""
+        if self._layer_stack is None: return (0, 0, 0, 0)
         layer = self._layer_stack.active
         c = self._drawing_panel.current_color()
-        paint_stamp(data=layer.data,
-                    cx=x - layer.offset_x, cy=y - layer.offset_y,
-                    color=(c.red(), c.green(), c.blue(), c.alpha()),
-                    size=self._drawing_panel.brush_size,
-                    hardness=self._drawing_panel.hardness,
-                    opacity=self._drawing_panel.opacity,
-                    mode=self._drawing_panel.active_tool)
+        return paint_stamp(
+            data=layer.data,
+            cx=x - layer.offset_x, cy=y - layer.offset_y,
+            color=(c.red(), c.green(), c.blue(), c.alpha()),
+            size=self._drawing_panel.brush_size,
+            hardness=self._drawing_panel.hardness,
+            opacity=self._drawing_panel.opacity,
+            mode=self._drawing_panel.active_tool)
 
     def _on_eyedropper_pick(self, x: int, y: int) -> None:
         arr = self._canvas.get_image()
@@ -934,9 +1033,19 @@ class MainWindow(QMainWindow):
 
     def _update_text_preview_on_canvas(self) -> None:
         dp = self._drawing_panel
-        self._canvas.set_text_preview(text=dp.text_content, font_family=dp.font_family,
-                                      font_size=dp.font_size_px, bold=dp.font_bold,
-                                      italic=dp.font_italic, color=dp.current_color())
+        ec = dp.text_effect_color
+        self._canvas.set_text_preview(
+            text=dp.text_content,
+            font_family=dp.font_family,
+            font_size=dp.font_size_px,
+            bold=dp.font_bold,
+            italic=dp.font_italic,
+            color=dp.current_color(),
+            opacity=dp.text_opacity,
+            effect=dp.text_effect,
+            effect_color=QColor(ec[0], ec[1], ec[2], ec[3]),
+            outline_width=dp.text_outline_width,
+        )
 
     def _apply_text(self) -> None:
         anchor = self._canvas.get_text_anchor()
@@ -945,14 +1054,26 @@ class MainWindow(QMainWindow):
         text = dp.text_content.strip()
         if not text: return
         layer = self._layer_stack.active
-        c = dp.current_color()
-        draw_text(data=layer.data, x=int(anchor[0] - layer.offset_x),
-                  y=int(anchor[1] - layer.offset_y), text=text,
-                  color_rgba=(c.red(), c.green(), c.blue(), c.alpha()),
-                  font_family=dp.font_family, font_size=dp.font_size_px)
+        c  = dp.current_color()
+        ec = dp.text_effect_color
+        draw_text(
+            data=layer.data,
+            x=int(anchor[0] - layer.offset_x),
+            y=int(anchor[1] - layer.offset_y),
+            text=text,
+            color_rgba=(c.red(), c.green(), c.blue(), c.alpha()),
+            font_family=dp.font_family,
+            font_size=dp.font_size_px,
+            bold=dp.font_bold,
+            italic=dp.font_italic,
+            opacity=dp.text_opacity,
+            effect=dp.text_effect,
+            effect_color=ec,
+            outline_width=dp.text_outline_width,
+        )
         self._canvas.clear_text_anchor()
         self._commit()
-        self.statusBar().showMessage(f"Testo \"{text}\" applicato.", 2500)  # type: ignore[union-attr]
+        self.statusBar().showMessage(f"Testo \"{text[:30]}\" applicato.", 2500)  # type: ignore[union-attr]
 
     # ── Trasformazioni ────────────────────────────────────────────────
 
@@ -1524,6 +1645,66 @@ class MainWindow(QMainWindow):
             self._wand_thread.quit()
             self._wand_thread.wait(500)
             self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    # ── Forme vettoriali ──────────────────────────────────────────────
+
+    def _on_shape_kind_changed(self, key: str) -> None:
+        self._canvas.set_shape_ghost_kind(_shape_key_to_kind(key))
+        if self._current_shape is not None:
+            self._on_shape_placed(self._current_shape.cx, self._current_shape.cy)
+
+    def _on_shape_placed(self, x: float, y: float) -> None:
+        dp = self._drawing_panel
+        kind = _shape_key_to_kind(dp.shape_kind_key)
+        shape = default_shape(kind, x, y)
+        _apply_panel_to_shape(dp, shape)
+        self._current_shape = shape
+        self._canvas.set_shape(shape)
+        self.statusBar().showMessage(  # type: ignore[union-attr]
+            "⬟ Forma inserita — trascina gli handle per modificarla", 2000)
+
+    def _on_shape_params_changed(self) -> None:
+        if self._current_shape is None:
+            return
+        _apply_panel_to_shape(self._drawing_panel, self._current_shape)
+        self._canvas.refresh_shape()
+
+    def _on_shape_handle_drag(self, hid_value: int, dx: float, dy: float) -> None:
+        if self._current_shape is None:
+            return
+        try:
+            hid = HandleID(hid_value)
+        except ValueError:
+            return
+        self._current_shape.apply_handle_drag(hid, dx, dy)
+        if hid in (HandleID.N_SIDES, HandleID.SQUIRCLE_EXP, HandleID.INNER_RADIUS):
+            self._drawing_panel.sync_shape_from(self._current_shape)
+        # refresh_shape: ridisegna senza resettare il drag handle
+        self._canvas.refresh_shape()
+
+    def _on_shape_apply(self) -> None:
+        if self._current_shape is None or self._layer_stack is None:
+            return
+        layer = self._layer_stack.active
+        if not isinstance(layer, Layer):
+            return
+        import dataclasses
+        s = self._current_shape
+        shape_layer = dataclasses.replace(
+            s,
+            cx=s.cx - layer.offset_x,
+            cy=s.cy - layer.offset_y,
+            arrow_ax=s.arrow_ax - layer.offset_x,
+            arrow_ay=s.arrow_ay - layer.offset_y,
+            arrow_bx=s.arrow_bx - layer.offset_x,
+            arrow_by=s.arrow_by - layer.offset_y,
+        )
+        render_shape_onto(layer.data, shape_layer)
+        self._current_shape = None
+        self._canvas.set_shape(None)
+        self._commit()
+        self.statusBar().showMessage(  # type: ignore[union-attr]
+            "⬟ Forma applicata sul layer.", 2000)
 
     # ── Upscaling ESRGAN ──────────────────────────────────────────────
 
