@@ -40,6 +40,7 @@ from ui.history_panel import HistoryPanel
 from ui.upscale_panel import UpscalePanel, _UpscaleWorker
 from core.magic_wand import magic_wand_select
 from core.raw_io import is_raw, load_raw, RAW_EXTENSIONS
+from ui.inpainting_panel import InpaintingPanel
 from core.shapes import (Shape, ShapeKind, ShapeStyle, HandleID,
                           default_shape, render_shape_onto)
 
@@ -111,6 +112,40 @@ class _MagicWandWorker(QObject):
             mask_canvas[cy0:cy1, cx0:cx1] = mask_layer[
                 ly0:ly0 + (cy1 - cy0), lx0:lx0 + (cx1 - cx0)]
             self.done.emit(mask_canvas)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class _LamaDownloadWorker(QObject):
+    progress = pyqtSignal(float, str)
+    done     = pyqtSignal()
+    error    = pyqtSignal(str)
+
+    def run(self) -> None:
+        try:
+            from core.inpainting import download_lama
+            download_lama(progress_cb=lambda f, m: self.progress.emit(f, m))
+            self.done.emit()
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class _InpaintWorker(QObject):
+    done  = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, rgba: np.ndarray, mask: np.ndarray,
+                 method: str, patch_size: int, radius: int) -> None:
+        super().__init__()
+        self._rgba = rgba; self._mask = mask
+        self._method = method; self._patch_size = patch_size; self._radius = radius
+
+    def run(self) -> None:
+        try:
+            from core.inpainting import inpaint
+            result = inpaint(self._rgba, self._mask, method=self._method,
+                             patch_size=self._patch_size, radius=self._radius)
+            self.done.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -205,7 +240,11 @@ class MainWindow(QMainWindow):
         self._rembg_thread: QThread | None = None
         self._rembg_worker: _RembgWorker | None = None
         self._heal_mask_acc: np.ndarray | None = None   # maschera cumulativa del tratto heal
-        self._wand_thread:  QThread | None = None
+        self._wand_thread:    QThread | None = None
+        self._lama_thread:    QThread | None = None
+        self._lama_worker:    _LamaDownloadWorker | None = None
+        self._inpaint_thread: QThread | None = None
+        self._inpaint_worker: _InpaintWorker | None = None
         self._wand_worker:  _MagicWandWorker | None = None
         self._current_shape: Shape | None = None
         self._svg_path:      str = ""
@@ -222,10 +261,12 @@ class MainWindow(QMainWindow):
         self._adjustment_panel   = AdjustmentPanel()
         self._free_transform_panel = FreeTransformPanel()
         self._upscale_panel      = UpscalePanel()
+        self._inpainting_panel   = InpaintingPanel()
 
         tabs = QTabWidget()
         tabs.setMinimumWidth(290)
         tabs.addTab(self._drawing_panel,        "✏ Disegno")
+        tabs.addTab(self._inpainting_panel,     "✨ Inpainting")
         tabs.addTab(self._matting_panel,        "✂ Scontorna")
         tabs.addTab(self._adjustment_panel,     "⚙ Regolazioni")
         tabs.addTab(self._free_transform_panel, "⇲ Trasforma")
@@ -273,6 +314,7 @@ class MainWindow(QMainWindow):
         self._canvas.clone_stroke_end.connect(self._on_clone_end)
         self._canvas.eyedropper_pick.connect(self._on_eyedropper_pick)
         self._canvas.text_anchor_changed.connect(self._on_text_anchor_changed)
+        self._canvas.text_rotation_changed.connect(self._on_text_rotation_changed)
         self._canvas.gradient_applied.connect(self._on_gradient_applied)
         self._canvas.heal_stroke_begin.connect(self._on_heal_begin)
         self._canvas.heal_stroke_move.connect(self._on_heal_move)
@@ -285,6 +327,10 @@ class MainWindow(QMainWindow):
         # Stato upscale thread
         self._upscale_thread: QThread | None = None
         self._upscale_worker: _UpscaleWorker | None = None
+
+        # ── Segnali InpaintingPanel ──────────────────────────────────
+        self._inpainting_panel.inpaint_requested.connect(self._on_inpaint_requested)
+        self._inpainting_panel.download_requested.connect(self._on_lama_download)
 
         # ── Segnali Forme (da DrawingPanel) ──────────────────────────
         self._drawing_panel.shape_changed.connect(self._on_shape_params_changed)
@@ -941,8 +987,11 @@ class MainWindow(QMainWindow):
 
     def _on_stroke_begin(self, x: float, y: float) -> None:
         if self._layer_stack is None: return
-        self._draw_bg_cache  = self._layer_stack.composite_without_active()
-        self._canvas_img_buf = self._layer_stack.fast_composite_active(self._draw_bg_cache)
+        # canvas_img_buf viene aggiornato in-place durante il tratto usando composite_rect
+        cw, ch = self._layer_stack.canvas_size   # canvas_size ritorna (width, height)
+        self._canvas_img_buf = np.zeros((ch, cw, 4), dtype=np.uint8)
+        composite_full = self._layer_stack.composite()
+        self._canvas_img_buf[:] = composite_full
         self._canvas.update_image(self._canvas_img_buf)
         self._last_stroke_pt = (x, y)
         if self._drawing_panel.active_tool != "smudge":
@@ -964,8 +1013,13 @@ class MainWindow(QMainWindow):
             r = self._drawing_panel.brush_size // 2 + 2
             self._flush_dirty((lx - r, ly - r, lx + r, ly + r))
         else:
+            dp = self._drawing_panel
+            bt = dp.brush_type if dp.active_tool == "brush" else dp.active_tool
+            # Calligrafia: punta stretta → passo più piccolo per tratto continuo
+            # Aerografo: spacing più largo (le particelle si sovrappongono da sole)
+            sf = {"calligraphy": 0.06, "airbrush": 0.4}.get(bt, 0.25)
             pts = interpolate_stroke(self._last_stroke_pt, (x, y),
-                                     self._drawing_panel.brush_size)
+                                     dp.brush_size, spacing_factor=sf)
             union = _union_dirty(self._apply_stamp(px, py) for px, py in pts)
             if union:
                 self._flush_dirty(union)
@@ -973,27 +1027,30 @@ class MainWindow(QMainWindow):
         self._last_stroke_pt = (x, y)
 
     def _flush_dirty(self, dirty_layer: tuple) -> None:
-        """Ricomposta solo il patch sporco e aggiorna solo quella regione del canvas."""
-        if self._draw_bg_cache is None or self._canvas_img_buf is None: return
+        """
+        Ricomposta solo il patch sporco usando composite_rect (tutti i layer,
+        ordine corretto) e aggiorna quella regione del canvas in tempo reale.
+        """
+        if self._canvas_img_buf is None: return
         layer = self._layer_stack.active
         lx0, ly0, lx1, ly1 = dirty_layer
         cx0 = int(lx0) + layer.offset_x
         cy0 = int(ly0) + layer.offset_y
         cx1 = int(lx1) + layer.offset_x
         cy1 = int(ly1) + layer.offset_y
-        ch, cw = self._draw_bg_cache.shape[:2]
+        ch, cw = self._canvas_img_buf.shape[:2]
         cx0 = max(0, cx0); cy0 = max(0, cy0)
         cx1 = min(cw, cx1); cy1 = min(ch, cy1)
         if cx0 >= cx1 or cy0 >= cy1: return
-        self._layer_stack.fast_composite_patch(
-            self._draw_bg_cache, self._canvas_img_buf,
-            cx0, cy0, cx1, cy1)
+        # composite_rect: compositing corretto di tutti i layer per la sola dirty rect
+        patch = self._layer_stack.composite_rect(cx0, cy0, cx1, cy1)
+        self._canvas_img_buf[cy0:cy1, cx0:cx1] = patch
         self._canvas.update_image_patch(
             self._canvas_img_buf, cx0, cy0, cx1, cy1)
 
     def _on_stroke_end(self) -> None:
         self._last_stroke_pt = None
-        self._draw_bg_cache  = None
+        self._draw_bg_cache  = None   # mantenuto per compatibilità con altri usi
         self._canvas_img_buf = None
         if self._layer_stack is None: return
         composite = self._layer_stack.composite()
@@ -1006,15 +1063,27 @@ class MainWindow(QMainWindow):
         """Applica un dab e restituisce la dirty rect in coordinate LAYER."""
         if self._layer_stack is None: return (0, 0, 0, 0)
         layer = self._layer_stack.active
-        c = self._drawing_panel.current_color()
+        c  = self._drawing_panel.current_color()
+        dp = self._drawing_panel
+        at = dp.active_tool  # "brush"|"eraser"|"smudge"|"heal"
+        if at == "eraser":
+            mode, tip = "eraser", "round"
+        else:
+            bt   = dp.brush_type  # "brush"|"airbrush"|"pencil"|"calligraphy"
+            mode = bt
+            tip  = "calligraphy" if bt == "calligraphy" else "round"
         return paint_stamp(
             data=layer.data,
             cx=x - layer.offset_x, cy=y - layer.offset_y,
             color=(c.red(), c.green(), c.blue(), c.alpha()),
-            size=self._drawing_panel.brush_size,
-            hardness=self._drawing_panel.hardness,
-            opacity=self._drawing_panel.opacity,
-            mode=self._drawing_panel.active_tool)
+            size=dp.brush_size,
+            hardness=dp.hardness,
+            opacity=dp.opacity,
+            mode=mode,
+            tip=tip,
+            tip_angle=dp.tip_angle,
+            tip_ratio=dp.tip_ratio,
+        )
 
     def _on_eyedropper_pick(self, x: int, y: int) -> None:
         arr = self._canvas.get_image()
@@ -1028,7 +1097,14 @@ class MainWindow(QMainWindow):
     def _on_text_anchor_changed(self, x: float, y: float) -> None:
         self._update_text_preview_on_canvas()
 
+    def _on_text_rotation_changed(self, deg: float) -> None:
+        """Il canvas ha ruotato il testo — sincronizza lo spinner."""
+        self._drawing_panel.set_text_rotation(deg)
+        self._update_text_preview_on_canvas()
+
     def _on_text_params_changed(self) -> None:
+        # Sincronizza la rotazione dal pannello al canvas quando si usa lo spinner
+        self._canvas.set_text_rotation(self._drawing_panel.text_rotation)
         self._update_text_preview_on_canvas()
 
     def _update_text_preview_on_canvas(self) -> None:
@@ -1045,6 +1121,7 @@ class MainWindow(QMainWindow):
             effect=dp.text_effect,
             effect_color=QColor(ec[0], ec[1], ec[2], ec[3]),
             outline_width=dp.text_outline_width,
+            rotation=float(dp.text_rotation),
         )
 
     def _apply_text(self) -> None:
@@ -1070,6 +1147,7 @@ class MainWindow(QMainWindow):
             effect=dp.text_effect,
             effect_color=ec,
             outline_width=dp.text_outline_width,
+            rotation=self._canvas.get_text_rotation(),
         )
         self._canvas.clear_text_anchor()
         self._commit()
@@ -1705,6 +1783,105 @@ class MainWindow(QMainWindow):
         self._commit()
         self.statusBar().showMessage(  # type: ignore[union-attr]
             "⬟ Forma applicata sul layer.", 2000)
+
+    # ── Inpainting ───────────────────────────────────────────────────
+
+    def _on_lama_download(self) -> None:
+        if self._lama_thread is not None:
+            return
+        self._inpainting_panel.on_download_started()
+        self._lama_worker = _LamaDownloadWorker()
+        self._lama_thread = QThread(self)
+        self._lama_worker.moveToThread(self._lama_thread)
+        self._lama_thread.started.connect(self._lama_worker.run)
+        self._lama_worker.progress.connect(self._inpainting_panel.on_download_progress)
+        self._lama_worker.done.connect(self._inpainting_panel.on_download_done)
+        self._lama_worker.error.connect(self._inpainting_panel.on_download_error)
+        self._lama_worker.done.connect(self._lama_thread.quit)
+        self._lama_worker.error.connect(self._lama_thread.quit)
+        self._lama_thread.finished.connect(self._lama_worker.deleteLater)
+        self._lama_thread.finished.connect(self._lama_thread.deleteLater)
+        self._lama_thread.finished.connect(lambda: setattr(self, '_lama_thread', None))
+        self._lama_thread.start()
+
+    def _on_inpaint_requested(self, method: str, patch_size: int, radius: int) -> None:
+        """Avvia l'inpainting sull'area selezionata."""
+        if self._layer_stack is None:
+            return
+        if self._sel_mask is None or not self._sel_mask.any():
+            self.statusBar().showMessage(  # type: ignore[union-attr]
+                "⚠ Seleziona prima l'area da rimuovere.", 3000)
+            return
+        if self._inpaint_thread is not None:
+            return   # già in corso
+
+        layer = self._layer_stack.active
+        if not isinstance(layer, Layer):
+            return
+
+        self._inpainting_panel.on_inpaint_started()
+        self.setCursor(Qt.CursorShape.WaitCursor)
+
+        # Converti la sel_mask da coordinate canvas a coordinate layer
+        lh, lw = layer.data.shape[:2]
+        ox, oy = layer.offset_x, layer.offset_y
+        cw, ch = self._layer_stack.canvas_size
+        sel = self._sel_mask
+
+        # Crea maschera layer-sized ritagliando la selezione canvas
+        layer_mask = np.zeros((lh, lw), dtype=bool)
+        # Intersezione layer ∩ canvas
+        cx0 = max(0, ox);       cy0 = max(0, oy)
+        cx1 = min(cw, ox + lw); cy1 = min(ch, oy + lh)
+        if cx1 > cx0 and cy1 > cy0:
+            lx0 = cx0 - ox; ly0 = cy0 - oy
+            lx1 = cx1 - ox; ly1 = cy1 - oy
+            layer_mask[ly0:ly1, lx0:lx1] = sel[cy0:cy1, cx0:cx1]
+
+        if not layer_mask.any():
+            self._inpainting_panel.on_inpaint_done()
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.statusBar().showMessage("⚠ Selezione fuori dai bordi del layer.", 3000)  # type: ignore[union-attr]
+            return
+
+        self._inpaint_worker = _InpaintWorker(
+            rgba=layer.data.copy(),
+            mask=layer_mask,
+            method=method,
+            patch_size=patch_size,
+            radius=radius,
+        )
+        self._inpaint_thread = QThread(self)
+        self._inpaint_worker.moveToThread(self._inpaint_thread)
+        self._inpaint_thread.started.connect(self._inpaint_worker.run)
+        self._inpaint_worker.done.connect(self._on_inpaint_done)
+        self._inpaint_worker.error.connect(self._on_inpaint_error)
+        self._inpaint_worker.done.connect(self._inpaint_thread.quit)
+        self._inpaint_worker.error.connect(self._inpaint_thread.quit)
+        self._inpaint_thread.finished.connect(self._inpaint_worker.deleteLater)
+        self._inpaint_thread.finished.connect(self._inpaint_thread.deleteLater)
+        self._inpaint_thread.finished.connect(self._inpaint_cleanup)
+        self._inpaint_thread.start()
+
+    def _on_inpaint_done(self, result: np.ndarray) -> None:
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._inpainting_panel.on_inpaint_done()
+        layer = self._layer_stack.active
+        layer.data[:] = result
+        self._set_selection(None)   # deseleziona dopo l'apply
+        self._commit()
+        self.statusBar().showMessage(  # type: ignore[union-attr]
+            "✨ Inpainting completato.", 3000)
+
+    def _on_inpaint_error(self, msg: str) -> None:
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._inpainting_panel.on_inpaint_done()
+        self.statusBar().showMessage(  # type: ignore[union-attr]
+            f"❌ Inpainting fallito: {msg}", 5000)
+
+    def _inpaint_cleanup(self) -> None:
+        self._inpaint_thread = None
+        self._inpaint_worker = None
 
     # ── Upscaling ESRGAN ──────────────────────────────────────────────
 

@@ -150,6 +150,42 @@ class DrawingPanel(QWidget):
         self._size_slider.valueChanged.connect(self.size_changed)
         root.addWidget(self._size_box)
 
+        # ── Tipo pennello ─────────────────────────────────────────────
+        self._brush_type_box = QGroupBox("Tipo pennello")
+        bt_layout = QVBoxLayout(self._brush_type_box)
+        self._brush_type_combo = QComboBox()
+        self._brush_type_combo.addItems([
+            "Pennello standard",
+            "Aerografo",
+            "Matita",
+            "Calligrafia",
+        ])
+        self._brush_type_combo.currentIndexChanged.connect(self._on_brush_type_changed)
+        bt_layout.addWidget(self._brush_type_combo)
+
+        # Punta calligrafica (angolo + larghezza relativa)
+        self._calli_angle_row = QHBoxLayout()
+        self._calli_angle_row.addWidget(QLabel("Angolo:"))
+        self._calli_angle = QSpinBox()
+        self._calli_angle.setRange(0, 179); self._calli_angle.setValue(45)
+        self._calli_angle.setSuffix("°")
+        self._calli_angle_row.addWidget(self._calli_angle)
+        self._calli_angle_row.addStretch()
+        bt_layout.addLayout(self._calli_angle_row)
+
+        self._calli_ratio_row = QHBoxLayout()
+        self._calli_ratio_row.addWidget(QLabel("Larghezza punta:"))
+        self._calli_ratio = QSpinBox()
+        self._calli_ratio.setRange(5, 95); self._calli_ratio.setValue(25)
+        self._calli_ratio.setSuffix("%")
+        self._calli_ratio_row.addWidget(self._calli_ratio)
+        self._calli_ratio_row.addStretch()
+        bt_layout.addLayout(self._calli_ratio_row)
+
+        self._brush_type_box.setVisible(False)  # visibile solo con brush/eraser
+        root.addWidget(self._brush_type_box)
+        self._on_brush_type_changed(0)  # init visibilità punta
+
         # ── Durezza / Intensità ────────────────────────────────────────
         self._hard_box = QGroupBox("Durezza")
         self._hard_slider, self._lbl_hard = self._make_slider_row(
@@ -259,9 +295,23 @@ class DrawingPanel(QWidget):
 
         self._on_text_effect_changed(0)   # inizia con "Nessuno"
 
+        # Rotazione testo
+        rot_row = QHBoxLayout()
+        rot_row.addWidget(QLabel("Rotazione:"))
+        self._txt_rotation = QSpinBox()
+        self._txt_rotation.setRange(-180, 180)
+        self._txt_rotation.setValue(0)
+        self._txt_rotation.setSuffix("°")
+        self._txt_rotation.setWrapping(True)
+        self._txt_rotation.valueChanged.connect(self._on_text_params_changed)
+        rot_row.addWidget(self._txt_rotation)
+        rot_row.addStretch()
+        text_layout.addLayout(rot_row)
+
         # Istruzioni
         hint = QLabel("<i>Clicca sul canvas per posizionare.<br>"
-                      "Trascina per spostare.</i>")
+                      "Trascina per spostare.<br>"
+                      "Handle ↻ per ruotare.</i>")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888; font-size: 10px;")
         text_layout.addWidget(hint)
@@ -618,9 +668,37 @@ class DrawingPanel(QWidget):
     def text_outline_width(self) -> int:
         return self._txt_outline_w.value()
 
-    # ── Shape properties ──────────────────────────────────────────────
+    # ── Brush / tip / rotation properties ────────────────────────────
 
     @property
+    def brush_type(self) -> str:
+        """Ritorna il tipo di pennello corrente."""
+        _types = ["brush", "airbrush", "pencil", "calligraphy"]
+        idx = self._brush_type_combo.currentIndex() if hasattr(self, "_brush_type_combo") else 0
+        return _types[idx] if 0 <= idx < len(_types) else "brush"
+
+    @property
+    def tip_angle(self) -> int:
+        return self._calli_angle.value() if hasattr(self, "_calli_angle") else 45
+
+    @property
+    def tip_ratio(self) -> int:
+        return self._calli_ratio.value() if hasattr(self, "_calli_ratio") else 25
+
+    @property
+    def text_rotation(self) -> int:
+        return self._txt_rotation.value() if hasattr(self, "_txt_rotation") else 0
+
+    def set_text_rotation(self, deg: int) -> None:
+        """Aggiorna lo spinner di rotazione testo senza emettere segnali."""
+        if hasattr(self, "_txt_rotation"):
+            self._txt_rotation.blockSignals(True)
+            # Normalizza in [-180, 180] — corrisponde al range dello spinner
+            v = ((float(deg) + 180.0) % 360.0) - 180.0
+            self._txt_rotation.setValue(int(round(v)))
+            self._txt_rotation.blockSignals(False)
+
+    # ── Shape properties ──────────────────────────────────────────────
     def shape_kind_key(self) -> str:
         return self._shape_kind_combo.currentData() or "ellipse"
 
@@ -753,6 +831,9 @@ class DrawingPanel(QWidget):
         self._hard_box.setVisible(is_draw or is_clone)
         self._op_box.setVisible((is_draw or is_clone) and self._active_tool != "smudge")
         self._text_box.setVisible(is_text)
+        if hasattr(self, "_brush_type_box"):
+            # Mostra solo per brush (non eraser/smudge che hanno logica propria)
+            self._brush_type_box.setVisible(self._active_tool == "brush")
         if hasattr(self, "_sel_box"):
             self._sel_box.setVisible(is_select)
         if hasattr(self, "_clone_hint"):
@@ -777,6 +858,14 @@ class DrawingPanel(QWidget):
 
     def _emit_shape_changed(self, *_) -> None:
         self.shape_changed.emit()
+
+    def _on_brush_type_changed(self, idx: int) -> None:
+        is_calli = (idx == 3)   # "Calligrafia"
+        for row in (self._calli_angle_row, self._calli_ratio_row):
+            for i in range(row.count()):
+                w = row.itemAt(i).widget()
+                if w:
+                    w.setVisible(is_calli)
 
     def _on_shape_kind_idx_changed(self, idx: int) -> None:
         key = self._shape_kind_combo.itemData(idx) or "ellipse"

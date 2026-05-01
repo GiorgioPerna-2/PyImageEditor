@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from enum import Enum, auto
 from typing import Optional
 
@@ -95,6 +96,7 @@ class ImageCanvas(QGraphicsView):
 
     # Text tool: current text anchor in scene (=image) coordinates
     text_anchor_changed = pyqtSignal(float, float)
+    text_rotation_changed = pyqtSignal(float)   # gradi
 
     # Gradiente: x1,y1,x2,y2 coordinate scena al rilascio
     gradient_applied = pyqtSignal(float, float, float, float)
@@ -140,6 +142,9 @@ class ImageCanvas(QGraphicsView):
         # Text state
         self._text_anchor: Optional[QPointF] = None  # scene coords
         self._text_dragging = False
+        self._text_rotation: float = 0.0             # gradi
+        self._text_rot_dragging = False
+        self._text_rot_last: Optional[QPointF] = None
         self._text_preview: dict = {}   # text, font_family, font_size, bold, italic, color
 
         # Shape state
@@ -290,9 +295,14 @@ class ImageCanvas(QGraphicsView):
             patch.tobytes(), pw, ph, pw * 4,
             QImage.Format.Format_RGBA8888)
 
-        # Disegna il patch sul QPixmap esistente in-place
+        # CompositionMode_Source: rimpiazza direttamente i pixel del QPixmap,
+        # inclusi quelli trasparenti (alpha=0). Con il default SourceOver,
+        # i pixel trasparenti non sovrascriverebbero quelli opachi esistenti,
+        # rendendo gomma e layer trasparenti invisibili in tempo reale.
         pm = existing
         painter = QPainter(pm)
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_Source)
         painter.drawImage(x0, y0, patch_qi)
         painter.end()
         self._pixmap_item.setPixmap(pm)
@@ -452,7 +462,8 @@ class ImageCanvas(QGraphicsView):
                          opacity: float = 1.0,
                          effect: str = "none",
                          effect_color: QColor = None,
-                         outline_width: int = 2) -> None:
+                         outline_width: int = 2,
+                         rotation: float = 0.0) -> None:
         """Aggiorna i parametri del testo di anteprima senza spostare l'ancora."""
         self._text_preview = dict(
             text=text, font_family=font_family,
@@ -461,15 +472,28 @@ class ImageCanvas(QGraphicsView):
             opacity=opacity, effect=effect,
             effect_color=QColor(effect_color) if effect_color else QColor(0, 0, 0, 200),
             outline_width=outline_width,
+            rotation=rotation,
         )
+        self._text_rotation = rotation
         self.viewport().update()
 
     def get_text_anchor(self) -> Optional[tuple[float, float]]:
         if self._text_anchor is None: return None
         return (self._text_anchor.x(), self._text_anchor.y())
 
+    def get_text_rotation(self) -> float:
+        return self._text_rotation
+
+    def set_text_rotation(self, deg: float) -> None:
+        d = float(deg)
+        self._text_rotation = ((d + 180.0) % 360.0) - 180.0
+        self.viewport().update()
+
     def clear_text_anchor(self) -> None:
         self._text_anchor = None
+        self._text_rotation = 0.0
+        self._text_rot_dragging = False
+        self._text_rot_last = None
         self.viewport().update()
 
     # ── API forme ─────────────────────────────────────────────────────
@@ -633,15 +657,25 @@ class ImageCanvas(QGraphicsView):
             return
 
         if self._mode == CanvasMode.TEXT and event.button() == Qt.MouseButton.LeftButton:
-            # Check if clicking near existing anchor → drag
             if self._text_anchor is not None:
+                # Hit-test handle di rotazione (diamante sopra l'ancora)
+                rot_vp = self._text_rotate_handle_vp()
+                if rot_vp is not None:
+                    d_rot = ((vp.x() - rot_vp.x())**2 + (vp.y() - rot_vp.y())**2) ** 0.5
+                    if d_rot <= _TEXT_DRAG_HIT:
+                        self._text_rot_dragging = True
+                        self._text_rot_last = QPointF(vp)
+                        self.setCursor(Qt.CursorShape.CrossCursor)
+                        return
+                # Hit-test ancora di posizione
                 anchor_vp = self.mapFromScene(self._text_anchor)
                 dist = ((vp.x() - anchor_vp.x())**2 + (vp.y() - anchor_vp.y())**2) ** 0.5
                 if dist <= _TEXT_DRAG_HIT:
                     self._text_dragging = True
                     return
-            # Click elsewhere → set new anchor
+            # Click altrove → nuovo anchor, reset rotazione
             self._text_anchor = QPointF(sp)
+            self._text_rotation = 0.0
             self._text_dragging = True
             self.text_anchor_changed.emit(sp.x(), sp.y())
             self.viewport().update()
@@ -748,7 +782,20 @@ class ImageCanvas(QGraphicsView):
 
         if self._mode == CanvasMode.TEXT:
             self._cursor_pos = vp
-            if self._text_dragging and self._text_anchor is not None:
+            if self._text_rot_dragging and self._text_rot_last is not None \
+                    and self._text_anchor is not None:
+                # Calcola angolo corrente e precedente rispetto all'ancora
+                ax_vp = self.mapFromScene(self._text_anchor)
+                prev = self._text_rot_last
+                angle_prev = math.atan2(prev.y() - ax_vp.y(), prev.x() - ax_vp.x())
+                angle_curr = math.atan2(vp.y()  - ax_vp.y(), vp.x()  - ax_vp.x())
+                delta_deg = math.degrees(angle_curr - angle_prev)
+                raw = self._text_rotation + delta_deg
+                # Normalizza in (-180, 180] — coerente con il range dello spinner
+                self._text_rotation = ((raw + 180.0) % 360.0) - 180.0
+                self._text_rot_last = QPointF(vp)
+                self.text_rotation_changed.emit(self._text_rotation)
+            elif self._text_dragging and self._text_anchor is not None:
                 self._text_anchor = QPointF(sp)
                 self.text_anchor_changed.emit(sp.x(), sp.y())
             self.viewport().update()
@@ -840,6 +887,9 @@ class ImageCanvas(QGraphicsView):
         if self._mode == CanvasMode.TEXT:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._text_dragging = False
+                self._text_rot_dragging = False
+                self._text_rot_last = None
+                self.setCursor(Qt.CursorShape.IBeamCursor)
             return
 
         if self._mode == CanvasMode.SHAPE:
@@ -1130,13 +1180,25 @@ class ImageCanvas(QGraphicsView):
         painter.drawLine(QPointF(cx, cy - ch), QPointF(cx, cy + ch))
         painter.restore()
 
+    def _text_rotate_handle_vp(self) -> Optional[QPointF]:
+        """Ritorna la posizione viewport del rotation handle del testo, o None."""
+        if self._text_anchor is None:
+            return None
+        ax_vp = self.mapFromScene(self._text_anchor)
+        # Handle a 32px sopra l'ancora in viewport, ruotato con la rotazione corrente
+        dist = 32.0
+        rad = math.radians(self._text_rotation - 90)
+        return QPointF(
+            ax_vp.x() + dist * math.cos(rad),
+            ax_vp.y() + dist * math.sin(rad),
+        )
+
     def _draw_text_overlay(self, painter: QPainter) -> None:
         """Anteprima del testo nel punto di ancoraggio (coordinate VIEWPORT)."""
         painter.save()
         painter.resetTransform()   # coordinate schermo
 
         if self._text_anchor is None:
-            # Cursore a croce finché non si clicca sul canvas
             if self._cursor_pos is not None:
                 painter.setPen(QPen(QColor(160, 120, 255, 160), 1.5))
                 sz = 10
@@ -1149,23 +1211,22 @@ class ImageCanvas(QGraphicsView):
         anchor_vp = self.mapFromScene(self._text_anchor)
         ax, ay = float(anchor_vp.x()), float(anchor_vp.y())
 
-        tp         = self._text_preview
-        text       = tp.get("text", "")
-        font_family= tp.get("font_family", "Arial")
-        font_size  = tp.get("font_size", 24)
-        bold       = tp.get("bold",   False)
-        italic     = tp.get("italic", False)
-        color      = tp.get("color",  QColor(0, 0, 0, 255))
-        opacity    = tp.get("opacity", 1.0)
-        effect     = tp.get("effect", "none")
-        ec         = tp.get("effect_color", QColor(0, 0, 0, 200))
-        outline_w  = tp.get("outline_width", 2)
+        tp          = self._text_preview
+        text        = tp.get("text", "")
+        font_family = tp.get("font_family", "Arial")
+        font_size   = tp.get("font_size", 24)
+        bold        = tp.get("bold",   False)
+        italic      = tp.get("italic", False)
+        color       = tp.get("color",  QColor(0, 0, 0, 255))
+        opacity     = tp.get("opacity", 1.0)
+        effect      = tp.get("effect", "none")
+        ec          = tp.get("effect_color", QColor(0, 0, 0, 200))
+        outline_w   = tp.get("outline_width", 2)
+        rotation    = tp.get("rotation", self._text_rotation)
 
-        # Font scalato con lo zoom corrente
         preview_size = max(4, int(font_size * self._zoom_factor))
 
         if text:
-            # Genera la patch con render_text_patch (stesso motore del render finale)
             ec_rgba = (ec.red(), ec.green(), ec.blue(), ec.alpha())
             c_rgba  = (color.red(), color.green(), color.blue(), color.alpha())
             try:
@@ -1179,20 +1240,16 @@ class ImageCanvas(QGraphicsView):
                     effect=effect,
                     effect_color=ec_rgba,
                     outline_width=outline_w,
+                    rotation=rotation,
                 )
                 ph, pw = patch_arr.shape[:2]
-                # Converti numpy RGBA → QImage e disegna
                 qi = QImage(patch_arr.tobytes(), pw, ph,
                             pw * 4, QImage.Format.Format_RGBA8888)
-                painter.drawImage(
-                    QPointF(ax - anchor_x, ay - anchor_y), qi)
-
-                # Rettangolo tratteggiato di selezione
+                painter.drawImage(QPointF(ax - anchor_x, ay - anchor_y), qi)
                 m = 2
                 rect = QRectF(ax - anchor_x - m, ay - anchor_y - m,
                               pw + m * 2, ph + m * 2)
             except Exception:
-                # Fallback minimale in caso di errore
                 rect = QRectF(ax - 2, ay - 2, 100, font_size + 4)
 
             pen = QPen(QColor(160, 120, 255, 200), 1.5)
@@ -1201,7 +1258,6 @@ class ImageCanvas(QGraphicsView):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(rect)
         else:
-            # Placeholder
             painter.setPen(QPen(QColor(160, 120, 255, 120), 1.5, Qt.PenStyle.DashLine))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(QRectF(ax - 4, ay - 20, 120, 30))
@@ -1209,6 +1265,35 @@ class ImageCanvas(QGraphicsView):
             f = QFont(); f.setPixelSize(11)
             painter.setFont(f)
             painter.drawText(QPointF(ax, ay), "Inserisci testo nel pannello →")
+
+        # ── Rotation handle ───────────────────────────────────────────
+        rot_vp = self._text_rotate_handle_vp()
+        if rot_vp is not None:
+            # Linea tratteggiata dall'ancora all'handle
+            painter.setPen(QPen(QColor(160, 120, 255, 150), 1.0,
+                                Qt.PenStyle.DashLine))
+            painter.drawLine(QPointF(ax, ay), rot_vp)
+            # Diamante
+            r = 6.0
+            is_rot_active = self._text_rot_dragging
+            fill_c = QColor(160, 120, 255, 240) if is_rot_active \
+                     else QColor(255, 255, 255, 230)
+            painter.setPen(QPen(QColor(120, 80, 200, 220), 1.5))
+            painter.setBrush(QBrush(fill_c))
+            path_r = QPainterPath()
+            path_r.moveTo(rot_vp.x(),     rot_vp.y() - r)
+            path_r.lineTo(rot_vp.x() + r, rot_vp.y())
+            path_r.lineTo(rot_vp.x(),     rot_vp.y() + r)
+            path_r.lineTo(rot_vp.x() - r, rot_vp.y())
+            path_r.closeSubpath()
+            painter.drawPath(path_r)
+            # Label "↻" quando si trascina
+            if is_rot_active:
+                f2 = QFont(); f2.setPixelSize(11)
+                painter.setFont(f2)
+                painter.setPen(QColor(120, 80, 200, 200))
+                painter.drawText(QPointF(rot_vp.x() + 8, rot_vp.y() - 4),
+                                 f"{int(self._text_rotation)}°")
 
         # Maniglietta di ancoraggio
         painter.setPen(QPen(QColor(160, 120, 255, 220), 1.5))

@@ -426,6 +426,7 @@ def render_text_patch(
     effect: str = "none",
     effect_color: Optional[RGBA] = None,
     outline_width: int = 2,
+    rotation: float = 0.0,
 ) -> Tuple[np.ndarray, int, int]:
     """
     Renderizza il testo in un array RGBA numpy.
@@ -493,10 +494,23 @@ def render_text_patch(
                    img_w, img_h)
     painter.end()
 
+    # Applica rotazione se richiesta
+    if rotation != 0.0:
+        from PyQt6.QtGui import QTransform
+        t = QTransform()
+        t.translate(anchor_x, anchor_y)
+        t.rotate(rotation)
+        t.translate(-anchor_x, -anchor_y)
+        img = img.transformed(t, Qt.TransformationMode.SmoothTransformation)
+        iw2, ih2 = img.width(), img.height()
+        anchor_x = iw2 // 2 - (img_w // 2 - anchor_x)
+        anchor_y = ih2 // 2 - (img_h // 2 - anchor_y)
+
     img_r = img.convertToFormat(QImage.Format.Format_RGBA8888)
     ptr   = img_r.bits()
     ptr.setsize(img_r.sizeInBytes())
-    arr   = np.frombuffer(ptr, dtype=np.uint8).reshape((img_h, img_w, 4)).copy()
+    arr   = np.frombuffer(ptr, dtype=np.uint8).reshape(
+        (img_r.height(), img_r.width(), 4)).copy()
     return arr, anchor_x, anchor_y
 
 
@@ -533,6 +547,7 @@ def draw_text(
     effect:      str   = "none",
     effect_color: Optional[RGBA] = None,
     outline_width: int = 2,
+    rotation:    float = 0.0,
 ) -> BBox:
     """
     Renderizza 'text' sul layer RGBA (H,W,4) a partire dall'ancora (x, y).
@@ -549,6 +564,7 @@ def draw_text(
         bold=bold,
         italic=italic,
         color_rgba=color_rgba,
+        rotation=rotation,
         opacity=opacity,
         effect=effect,
         effect_color=effect_color,

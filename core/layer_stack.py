@@ -530,6 +530,112 @@ class LayerStack:
             self._active_path = tuple(shifted)
 
 
+    def composite_rect(
+        self,
+        cx0: int, cy0: int,
+        cx1: int, cy1: int,
+    ) -> np.ndarray:
+        """
+        Composita correttamente TUTTI i layer (ordine corretto, adjustment layers inclusi)
+        per la sola regione [cx0:cx1, cy0:cy1] del canvas.
+
+        O(n_layers × patch_area) invece di O(n_layers × W×H):
+        per un pennello da 40px su un canvas 3000px, è ~5000× più veloce del full composite.
+
+        Returns
+        -------
+        uint8 RGBA (cy1-cy0, cx1-cx0, 4)
+        """
+        ph = cy1 - cy0
+        pw = cx1 - cx0
+        if ph <= 0 or pw <= 0:
+            return np.zeros((1, 1, 4), dtype=np.uint8)
+
+        result = np.zeros((ph, pw, 4), dtype=np.float32)
+        self._composite_nodes_rect(
+            self._nodes, cx0, cy0, cx1, cy1, result, depth_prefix=())
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    def _composite_nodes_rect(
+        self,
+        nodes: list,
+        cx0: int, cy0: int,
+        cx1: int, cy1: int,
+        result: np.ndarray,
+        depth_prefix: tuple,
+    ) -> None:
+        """
+        Itera i nodi e composta solo la regione [cx0:cx1, cy0:cy1] su 'result'.
+        'result' è float32 (ph, pw, 4) con ph=cy1-cy0, pw=cx1-cx0.
+        """
+        ph, pw = result.shape[:2]
+        for i, node in enumerate(nodes):
+            if not node.visible:
+                continue
+            current_path = (*depth_prefix, i)
+
+            if isinstance(node, AdjustmentLayer):
+                # Gli adjustment layer operano su tutto il result accumulato finora.
+                # Estrae il patch, applica il filtro, reinserisce.
+                # Crea un canvas temporaneo di dimensione canonica, applica, ritaglia.
+                tmp = np.zeros((self._canvas_h, self._canvas_w, 4), dtype=np.float32)
+                tmp[cy0:cy1, cx0:cx1] = result
+                tmp = node.apply(tmp)
+                result[:] = tmp[cy0:cy1, cx0:cx1]
+                continue
+
+            if isinstance(node, LayerGroup):
+                if not node.children:
+                    continue
+                group_buf = np.zeros((ph, pw, 4), dtype=np.float32)
+                self._composite_nodes_rect(
+                    node.children, cx0, cy0, cx1, cy1, group_buf, current_path)
+                dst = result
+                result[:] = _composite_over(dst, group_buf, node.opacity, node.blend_mode)
+                continue
+
+            # Layer foglia
+            raw = node.data
+            lh, lw = raw.shape[:2]
+            ox, oy = node.offset_x, node.offset_y
+
+            # Intersezione del patch richiesto con l'estensione del layer nel canvas
+            # (tutto in coordinate canvas assolute)
+            ix0 = max(cx0, max(0, ox))
+            iy0 = max(cy0, max(0, oy))
+            ix1 = min(cx1, min(self._canvas_w, ox + lw))
+            iy1 = min(cy1, min(self._canvas_h, oy + lh))
+            if ix0 >= ix1 or iy0 >= iy1:
+                continue
+
+            # Coordinate locali nel layer
+            llx0 = ix0 - ox;  lly0 = iy0 - oy
+            llx1 = ix1 - ox;  lly1 = iy1 - oy
+
+            # Coordinate nel buffer result (che copre [cx0:cx1, cy0:cy1])
+            rx0 = ix0 - cx0;  ry0 = iy0 - cy0
+            rx1 = ix1 - cx0;  ry1 = iy1 - cy0
+
+            region = raw[lly0:lly1, llx0:llx1].astype(np.float32)
+
+            if node.mask is not None:
+                mh, mw = node.mask.shape
+                mlx1 = min(mw, llx1);  mly1 = min(mh, lly1)
+                if mlx1 > llx0 and mly1 > lly0:
+                    mask_r = node.mask[lly0:mly1, llx0:mlx1].astype(np.float32) / 255.0
+                    ph_m = min(region.shape[0], mask_r.shape[0])
+                    pw_m = min(region.shape[1], mask_r.shape[1])
+                    region = region[:ph_m, :pw_m].copy()
+                    region[:, :, 3] *= mask_r[:ph_m, :pw_m]
+                    rx1 = rx0 + region.shape[1]
+                    ry1 = ry0 + region.shape[0]
+
+            dst_slice = result[ry0:ry1, rx0:rx1]
+            result[ry0:ry1, rx0:rx1] = _composite_over(
+                dst_slice, region, node.opacity, node.blend_mode)
+
+
+
 # ── Compositor ────────────────────────────────────────────────────────────────
 
 def _blend_rgb(src: np.ndarray, dst: np.ndarray, mode: str) -> np.ndarray:
@@ -547,7 +653,6 @@ def _blend_rgb(src: np.ndarray, dst: np.ndarray, mode: str) -> np.ndarray:
     elif mode == "lighten":    b = np.maximum(s, d)
     else:                      b = s
     return b * 255.0
-
 
 def _dirty_complement(
     dy0: int, dy1: int, dx0: int, dx1: int,   # outer dirty rect
