@@ -8,7 +8,7 @@ from ui.main_window import MainWindow
 
 def main() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName("Image Suite")
+    app.setApplicationName("PyImageEditor")
     app.setApplicationVersion("0.13.0")
     app.setOrganizationName("ImageSuite")
 

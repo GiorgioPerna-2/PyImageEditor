@@ -1,4 +1,0 @@
-- casella di testo non va a capo con il testo, aggiungere font più alborati con effetti e colori multipli
-- upscaling di un'immagine grande può far crashare l'applicazione, mettere guardie/avvisi per impedirlo
-- bacchetta magica non funziona, blocca sistematicamente l'applicazione, non è possibile disinserire lo strumento, non termina il processo di selezione
-- apri raw formato .NEF non riconosciuto
