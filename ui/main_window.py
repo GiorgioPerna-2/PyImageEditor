@@ -390,6 +390,8 @@ class MainWindow(QMainWindow):
         self._filter_panel.filters_changed.connect(self._on_filter_preview)
         self._filter_panel.apply_clicked.connect(self._apply_filters)
         self._filter_panel.reset_clicked.connect(self._reset_filters)
+        self._filter_panel.spatial_apply.connect(self._on_spatial_filter_apply)
+        self._filter_panel.spectrum_request.connect(self._on_spectrum_request)
 
         self._transform_panel.rotate_requested.connect(self._on_rotate)
         self._transform_panel.flip_requested.connect(self._on_flip)
@@ -925,6 +927,50 @@ class MainWindow(QMainWindow):
         if self._layer_stack is None: return
         self._filters = FilterStack(); self._preview = None
         self._canvas.update_image(self._layer_stack.composite())
+
+    def _on_spatial_filter_apply(self, key: str, params: dict, sel_only: bool) -> None:
+        """Applica un filtro spaziale o FFT, opzionalmente solo sull'area selezionata."""
+        if self._layer_stack is None: return
+        layer = self._layer_stack.active
+        if not isinstance(layer, Layer): return
+        from core.image_filters import SPATIAL_FILTERS, apply_to_selection
+        entry = SPATIAL_FILTERS.get(key)
+        if entry is None or entry[1] is None: return
+        fn = entry[1]
+        base = layer.data.copy()
+        filtered = fn(base, **params)
+        if sel_only and self._sel_mask is not None and self._sel_mask.any():
+            # Converti sel_mask canvas → layer
+            lh, lw = base.shape[:2]
+            ox, oy = layer.offset_x, layer.offset_y
+            cw, ch = self._layer_stack.canvas_size
+            layer_mask = np.zeros((lh, lw), dtype=bool)
+            cx0=max(0,ox); cy0=max(0,oy)
+            cx1=min(cw,ox+lw); cy1=min(ch,oy+lh)
+            if cx1>cx0 and cy1>cy0:
+                lx0=cx0-ox; ly0=cy0-oy; lx1=cx1-ox; ly1=cy1-oy
+                layer_mask[ly0:ly1, lx0:lx1] = self._sel_mask[cy0:cy1, cx0:cx1]
+            result = apply_to_selection(base, filtered, layer_mask)
+        else:
+            result = filtered
+        self._layer_stack.set_active_data(result)
+        self._commit()
+        self.statusBar().showMessage(  # type: ignore[union-attr]
+            f"Filtro '{key}' applicato.", 2000)
+
+    def _on_spectrum_request(self) -> None:
+        """Visualizza lo spettro FFT come layer temporaneo."""
+        if self._layer_stack is None: return
+        layer = self._layer_stack.active
+        if not isinstance(layer, Layer): return
+        from core.image_filters import fft_spectrum
+        spec = fft_spectrum(layer.data)
+        # Mostra come overlay senza modificare il layer
+        tmp = self._layer_stack.composite_with_override(
+            self._layer_stack.active_path, spec)
+        self._canvas.update_image(tmp)
+        self.statusBar().showMessage(  # type: ignore[union-attr]
+            "Spettro FFT — premi Reset per tornare all'immagine.", 3000)
 
     # ── Strumenti disegno ─────────────────────────────────────────────
 

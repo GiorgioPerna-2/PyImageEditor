@@ -699,6 +699,7 @@ class DrawingPanel(QWidget):
             self._txt_rotation.blockSignals(False)
 
     # ── Shape properties ──────────────────────────────────────────────
+    @property
     def shape_kind_key(self) -> str:
         return self._shape_kind_combo.currentData() or "ellipse"
 
